@@ -66,3 +66,8 @@ arrows nudge (Shift ×5) · `Ctrl+S` export JSON · the circuit is autosaved to 
 1. Obstacle-aware wire routing and wire waypoints.
 2. Wire/SPI/EEPROM libraries and structs/classes in the sketch compiler.
 3. Split `engine/devices.ts` further.
+
+
+## Actualización del source
+
+Repositorio actualizado con el source nuevo de CircuitLab: motor de simulación ampliado, dispositivos adicionales, MCU, editor de código, monitor serie y nuevos paneles de interfaz.
