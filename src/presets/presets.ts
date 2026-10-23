@@ -1,4 +1,5 @@
 import { getDef } from "@/models/catalog";
+import { templateById } from "@/mcu/templates";
 import type { CircuitData, Params, PlacedComponent, Rotation, Wire } from "@/models/types";
 
 /** Tiny builder so preset layouts read like a netlist. */
@@ -7,7 +8,7 @@ class Builder {
   private wires: Wire[] = [];
   private counters: Record<string, number> = {};
 
-  add(kind: string, x: number, y: number, params: Params = {}, rotation: Rotation = 0, label?: string): string {
+  add(kind: string, x: number, y: number, params: Params = {}, rotation: Rotation = 0, label?: string, mirror = false): string {
     const def = getDef(kind);
     const n = (this.counters[def.prefix] = (this.counters[def.prefix] ?? 0) + 1);
     const id = `${kind}_${this.comps.length}`;
@@ -17,7 +18,7 @@ class Builder {
       x,
       y,
       rotation,
-      mirror: false,
+      mirror,
       params: { ...def.defaults, ...params },
       label: label ?? (def.prefix === "GND" ? "GND" : `${def.prefix}${n}`),
     });
@@ -216,6 +217,167 @@ function bjtAmplifier(): CircuitData {
   return b.build("BJT common-emitter amplifier (gain ≈ −100)");
 }
 
+const tpl = (id: string): string => templateById(id)?.code ?? "";
+const TEMPLATE_POT = tpl("pot");
+const TEMPLATE_SERVO = tpl("servo");
+const TEMPLATE_SONAR = tpl("sonar");
+const TEMPLATE_LCD = tpl("lcd");
+
+// ───────────────────────── Microcontroller presets ─────────────────────────
+// Uno placed at (12,2): left pins at x=12, right pins at x=21; pin n of a side sits at y = 2 + row.
+
+/** Series resistor + LED from an Arduino pin to ground, laid out to the right. */
+function mcuLed(b: Builder, board: string, pin: string, x: number, y: number, color = "red"): void {
+  const r = b.add("resistor", x, y, { resistance: 330 });
+  const d = b.add("led", x + 6, y, { color });
+  const g = b.add("ground", x + 10, y + 3);
+  b.wire(board, pin, r, "a");
+  b.wire(r, "b", d, "a");
+  b.wire(d, "k", g, "g");
+}
+
+function arduinoBlink(): CircuitData {
+  const b = new Builder();
+  const uno = b.add("arduino_uno", 12, 2, {}, 0, "UNO");
+  mcuLed(b, uno, "d13", 24, 16);
+  const g = b.add("ground", 21, 21);
+  b.wire(uno, "gnd3", g, "g");
+  return b.build("Arduino Uno — LED Blink");
+}
+
+function arduinoButton(): CircuitData {
+  const b = new Builder();
+  const uno = b.add("arduino_uno", 12, 2, {}, 0, "UNO");
+  mcuLed(b, uno, "d13", 24, 16);
+  const btn = b.add("pushbutton", 24, 5);
+  const gb = b.add("ground", 28, 8);
+  b.wire(uno, "d2", btn, "a");
+  b.wire(btn, "b", gb, "g");
+  const g = b.add("ground", 21, 21);
+  b.wire(uno, "gnd3", g, "g");
+  return b.build("Arduino Uno — Button to LED");
+}
+
+const FADE_SKETCH = `int led = 9;
+int brightness = 0;
+int step = 5;
+
+void setup() {
+  pinMode(led, OUTPUT);
+}
+
+void loop() {
+  analogWrite(led, brightness);
+  brightness += step;
+  if (brightness <= 0 || brightness >= 255) step = -step;
+  delay(20);
+}
+`;
+
+function arduinoFade(): CircuitData {
+  const b = new Builder();
+  const uno = b.add("arduino_uno", 12, 2, { code: FADE_SKETCH }, 0, "UNO");
+  mcuLed(b, uno, "d9", 24, 12, "green");
+  const g = b.add("ground", 21, 21);
+  b.wire(uno, "gnd3", g, "g");
+  return b.build("Arduino Uno — PWM fade");
+}
+
+function arduinoPot(): CircuitData {
+  const b = new Builder();
+  const code = TEMPLATE_POT;
+  const uno = b.add("arduino_uno", 12, 2, { code }, 0, "UNO");
+  const pot = b.add("potentiometer", 2, 9, { resistance: 10000, wiper: 30 });
+  const g1 = b.add("ground", 6, 13);
+  b.wire(uno, "5v", pot, "a");
+  b.wire(pot, "b", g1, "g");
+  b.wire(pot, "w", uno, "a0");
+  mcuLed(b, uno, "d9", 24, 12, "yellow");
+  const g = b.add("ground", 21, 21);
+  b.wire(uno, "gnd3", g, "g");
+  return b.build("Arduino Uno — Pot dims LED + serial");
+}
+
+function arduinoServo(): CircuitData {
+  const b = new Builder();
+  const uno = b.add("arduino_uno", 12, 2, { code: TEMPLATE_SERVO }, 0, "UNO");
+  const sv = b.add("servo", 26, 6, { angle: 90 });
+  const bat = b.add("vdc", 24, 14, { voltage: 5, rint: 0.05 });
+  const gs = b.add("ground", 24, 20);
+  b.wire(uno, "d9", sv, "sig");
+  b.wire(bat, "p", sv, "vcc");
+  b.wire(bat, "n", gs, "g");
+  b.wire(sv, "gnd", gs, "g");
+  const g = b.add("ground", 21, 21);
+  b.wire(uno, "gnd3", g, "g");
+  return b.build("Arduino Uno — Servo sweep");
+}
+
+function arduinoSonar(): CircuitData {
+  const b = new Builder();
+  const uno = b.add("arduino_uno", 12, 2, { code: TEMPLATE_SONAR }, 0, "UNO");
+  const hc = b.add("hcsr04", 26, 2, { distanceCm: 80 });
+  const bat = b.add("vdc", 36, 2, { voltage: 5, rint: 0.05 });
+  const gs = b.add("ground", 36, 8);
+  b.wire(uno, "d7", hc, "trig");
+  b.wire(uno, "d8", hc, "echo");
+  b.wire(bat, "p", hc, "vcc");
+  b.wire(bat, "n", gs, "g");
+  b.wire(hc, "gnd", gs, "g");
+  const g = b.add("ground", 21, 21);
+  b.wire(uno, "gnd3", g, "g");
+  return b.build("Arduino Uno — HC-SR04 distance");
+}
+
+function arduinoLcd(): CircuitData {
+  const b = new Builder();
+  const uno = b.add("arduino_uno", 12, 2, { code: TEMPLATE_LCD }, 0, "UNO");
+  const lcd = b.add("lcd1602", 26, 2);
+  const g = b.add("ground", 21, 21);
+  const gl = b.add("ground", 24, 14);
+  b.wire(uno, "gnd3", g, "g");
+  b.wire(uno, "d12", lcd, "rs");
+  b.wire(uno, "d11", lcd, "e");
+  b.wire(uno, "d5", lcd, "d4");
+  b.wire(uno, "d4", lcd, "d5");
+  b.wire(uno, "d3", lcd, "d6");
+  b.wire(uno, "d2", lcd, "d7");
+  b.wire(lcd, "vss", gl, "g");
+  b.wire(lcd, "rw", gl, "g");
+  b.wire(lcd, "v0", gl, "g");
+  b.wire(lcd, "k", gl, "g");
+  b.wire(lcd, "vdd", uno, "5v");
+  b.wire(lcd, "a", uno, "5v");
+  return b.build("Arduino Uno — LCD 16x2 (4-bit)");
+}
+
+function esp32Blink(): CircuitData {
+  const b = new Builder();
+  const esp = b.add("esp32", 2, 2, {}, 0, "ESP32");
+  mcuLed(b, esp, "r_g2", 14, 16, "blue");
+  const g = b.add("ground", 11, 19);
+  b.wire(esp, "r_gnd", g, "g");
+  return b.build("ESP32 — LED Blink");
+}
+
+function attinyBlink(): CircuitData {
+  const b = new Builder();
+  const t = b.add("attiny85", 2, 2, {}, 0, "ATtiny");
+  const bat = b.add("vdc", 14, 8, { voltage: 5, rint: 0.05 });
+  const gb = b.add("ground", 14, 14);
+  const g4 = b.add("ground", 2, 9);
+  b.wire(t, "p8", bat, "p");
+  b.wire(bat, "n", gb, "g");
+  b.wire(t, "p4", g4, "g");
+  const r = b.add("resistor", 14, 5, { resistance: 330 });
+  const d = b.add("led", 20, 5, { color: "red" });
+  const gl = b.add("ground", 24, 8);
+  b.wire(t, "p6", r, "a");
+  b.wire(r, "b", d, "a");
+  b.wire(d, "k", gl, "g");
+  return b.build("ATtiny85 — LED Blink (PB1)");
+}
+
 export const PRESETS: Preset[] = [
   { id: "led", speed: 1, name: "LED + Resistor", description: "5 V → 330 Ω → red LED. Try a smaller resistor to watch it burn.", build: ledResistor },
   { id: "divider", speed: 1, name: "Voltage Divider", description: "10 V across 1 kΩ / 3 kΩ with a multimeter reading 7.5 V.", build: voltageDivider },
@@ -223,4 +385,13 @@ export const PRESETS: Preset[] = [
   { id: "555", speed: 1, name: "555 Blinking LED", description: "Astable 555 timer driving an LED at about 7 Hz.", build: ne555Blinker },
   { id: "bridge", speed: 0.05, name: "Bridge Rectifier", description: "12 V AC full-wave rectified into a 470 µF reservoir.", build: bridgeRectifier },
   { id: "bjt", speed: 0.01, name: "BJT Amplifier", description: "Common-emitter stage with voltage-divider bias and bypassed emitter.", build: bjtAmplifier },
+  { id: "uno-blink", speed: 1, name: "Arduino · LED Blink", description: "Uno running a Blink sketch on D13 — edit the code in the Code tab.", build: arduinoBlink },
+  { id: "uno-button", speed: 1, name: "Arduino · Button → LED", description: "INPUT_PULLUP button on D2; click it while running.", build: arduinoButton },
+  { id: "uno-fade", speed: 1, name: "Arduino · PWM fade", description: "analogWrite fading an LED on D9 (watch the scope-less glow).", build: arduinoFade },
+  { id: "uno-pot", speed: 1, name: "Arduino · Pot + Serial", description: "analogRead from a potentiometer dims the LED and prints to the Serial monitor.", build: arduinoPot },
+  { id: "uno-servo", speed: 1, name: "Arduino · Servo sweep", description: "Servo library sweeping a servo 0–180° on D9, externally powered.", build: arduinoServo },
+  { id: "uno-sonar", speed: 1, name: "Arduino · HC-SR04", description: "pulseIn distance measurement; change the distance in the sensor Inspector.", build: arduinoSonar },
+  { id: "uno-lcd", speed: 1, name: "Arduino · LCD 16×2", description: "LiquidCrystal in 4-bit mode with a simulated HD44780.", build: arduinoLcd },
+  { id: "esp32-blink", speed: 1, name: "ESP32 · LED Blink", description: "ESP32 DevKit blinking GPIO2 (3.3 V logic).", build: esp32Blink },
+  { id: "attiny-blink", speed: 1, name: "ATtiny85 · LED Blink", description: "ATtiny85 on a 5 V supply blinking PB1.", build: attinyBlink },
 ];

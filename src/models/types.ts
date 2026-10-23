@@ -105,7 +105,15 @@ export type SimModel =
   | "timer555"
   | "regulator"
   | "mcu"
-  | "meter";
+  | "meter"
+  | "jfet"
+  | "scr"
+  | "triac"
+  | "opto"
+  | "transformer"
+  | "servo"
+  | "ultrasonic"
+  | "lcd";
 
 /** How the part looks in physical (photoreal-vector) view. */
 export type PackageStyle =

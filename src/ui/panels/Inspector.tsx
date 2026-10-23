@@ -1,12 +1,13 @@
 "use client";
 
-import { Copy, FlipHorizontal2, Palette, RotateCw, Trash2, Wrench } from "lucide-react";
-import { useState } from "react";
+import { Code2, Copy, FlipHorizontal2, Palette, RotateCw, Trash2, Wrench } from "lucide-react";
+import { useState, useSyncExternalStore } from "react";
 import { getDef } from "@/models/catalog";
 import { resistanceToBands } from "@/models/resistorColor";
 import type { ComponentSnapshot, ParamField, PlacedComponent, Wire, WireColor } from "@/models/types";
 import { UNIT_CHOICES, UNIT_SYMBOL, formatEng, prefixExp, splitEng } from "@/models/units";
 import { getLive, burnTimes, sim } from "@/engine/runtime";
+import { getIo } from "@/mcu/io";
 import { cn } from "@/lib/utils";
 import { useCircuitStore } from "@/store/circuitStore";
 import { useSimStore } from "@/store/simulationStore";
@@ -241,12 +242,8 @@ function ComponentInspector({ comp }: { comp: PlacedComponent }): React.JSX.Elem
         </div>
       )}
 
-      {def.sim === "mcu" && (
-        <div className="border border-bg-line bg-bg p-2 text-[11px] leading-snug text-ink-dim">
-          Pinout is mapped and wireable. Sketch execution (Monaco editor + GPIO simulation) is the next module.
-        </div>
-      )}
-      {def.sim === "none" && def.category !== "instrument" && def.sim === "none" && !["hcsr04", "lcd1602", "servo", "ground"].includes(def.kind) && (
+      {def.sim === "mcu" && <McuBlock id={comp.id} />}
+      {def.sim === "none" && def.category !== "instrument" && def.kind !== "ground" && (
         <div className="border border-neon-amber/40 bg-neon-amber/5 p-2 text-[11px] text-neon-amber">
           Drawn and wireable; electrical model not simulated in this build.
         </div>
@@ -254,6 +251,27 @@ function ComponentInspector({ comp }: { comp: PlacedComponent }): React.JSX.Elem
       {(comp.kind === "toggle_switch" || comp.kind === "pushbutton" || comp.kind === "dip_switch") && (
         <div className="text-[11px] text-ink-faint">While the simulation is running, click the part on the canvas to operate it.</div>
       )}
+    </div>
+  );
+}
+
+function McuBlock({ id }: { id: string }): React.JSX.Element {
+  const openCode = useUiStore((s) => s.openCode);
+  const io = getIo(id);
+  useSyncExternalStore(
+    (fn) => io.subscribe(fn),
+    () => io.version,
+    () => 0,
+  );
+  const st = io.status;
+  return (
+    <div className="space-y-2 border border-bg-line bg-bg p-2 text-[11px] leading-snug text-ink-dim">
+      <Button variant="primary" className="w-full" onClick={() => openCode(id)}>
+        <Code2 className="h-3.5 w-3.5" /> Edit code
+      </Button>
+      <div className={cn("font-mono", st.kind === "running" ? "text-neon-cyan" : st.kind === "error" ? "text-neon-red" : "text-ink-faint")}>
+        {st.kind === "running" ? "● Running sketch" : st.kind === "error" ? `✕ ${st.message}` : st.kind === "off" ? "○ Not powered" : "Idle — press Run"}
+      </div>
     </div>
   );
 }

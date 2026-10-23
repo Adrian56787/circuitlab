@@ -113,22 +113,42 @@ function simplify(pts: Vec2[]): Vec2[] {
 export function orthogonalRoute(a: Vec2, da: Vec2, b: Vec2, db: Vec2): Vec2[] {
   const p1 = add(a, da);
   const p2 = add(b, db);
-  let mid: Vec2[];
-  if (Math.abs(p1.x - p2.x) < 1e-9 || Math.abs(p1.y - p2.y) < 1e-9) {
-    mid = [p1, p2];
-  } else if (da.x !== 0 && db.x !== 0) {
-    // horizontal–vertical–horizontal
-    const xm = snap((p1.x + p2.x) / 2, 0.5);
-    mid = [p1, { x: xm, y: p1.y }, { x: xm, y: p2.y }, p2];
-  } else if (da.y !== 0 && db.y !== 0) {
-    const ym = snap((p1.y + p2.y) / 2, 0.5);
-    mid = [p1, { x: p1.x, y: ym }, { x: p2.x, y: ym }, p2];
-  } else if (da.x !== 0) {
-    mid = [p1, { x: p2.x, y: p1.y }, p2];
-  } else {
-    mid = [p1, { x: p1.x, y: p2.y }, p2];
+  const xs = [snap((p1.x + p2.x) / 2, 0.5), Math.max(p1.x, p2.x) + 1, Math.min(p1.x, p2.x) - 1];
+  const ys = [snap((p1.y + p2.y) / 2, 0.5), Math.max(p1.y, p2.y) + 1, Math.min(p1.y, p2.y) - 1];
+  const mids: Vec2[][] = [
+    [p1, p2],
+    [p1, { x: p2.x, y: p1.y }, p2],
+    [p1, { x: p1.x, y: p2.y }, p2],
+    ...xs.map((xm) => [p1, { x: xm, y: p1.y }, { x: xm, y: p2.y }, p2]),
+    ...ys.map((ym) => [p1, { x: p1.x, y: ym }, { x: p2.x, y: ym }, p2]),
+  ];
+  let best: Vec2[] | null = null;
+  let bestCost = Infinity;
+  for (const mid of mids) {
+    // axis-aligned only
+    let aligned = true;
+    for (let i = 0; i < mid.length - 1; i++) {
+      const u = mid[i]!;
+      const v = mid[i + 1]!;
+      if (Math.abs(u.x - v.x) > 1e-9 && Math.abs(u.y - v.y) > 1e-9) aligned = false;
+    }
+    if (!aligned) continue;
+    const pts = simplify([a, ...mid, b]);
+    if (pts.length < 2) continue;
+    // never fold back through the pin stubs
+    const first = pts[1]!;
+    const last = pts[pts.length - 2]!;
+    const dirA = { x: Math.sign(first.x - a.x), y: Math.sign(first.y - a.y) };
+    const dirB = { x: Math.sign(last.x - b.x), y: Math.sign(last.y - b.y) };
+    if (dirA.x * da.x + dirA.y * da.y < 0 || dirB.x * db.x + dirB.y * db.y < 0) continue;
+    const cost = polylineLength(pts) + 3 * (pts.length - 2);
+    if (cost < bestCost - 1e-9) {
+      bestCost = cost;
+      best = pts;
+    }
   }
-  return simplify([a, ...mid, b]);
+  if (best) return best;
+  return simplify([a, p1, { x: p2.x, y: p1.y }, p2, b]);
 }
 
 export function bezierRoute(a: Vec2, da: Vec2, b: Vec2, db: Vec2, samples = 28): Vec2[] {

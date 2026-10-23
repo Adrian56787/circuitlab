@@ -1,6 +1,7 @@
 import { LED_VF } from "@/models/catalog";
 import { BAND_COLORS, resistanceToBands } from "@/models/resistorColor";
 import { formatEng } from "@/models/units";
+import { peekLcd } from "@/engine/lcdStore";
 import { probes } from "@/engine/probes";
 import type { ComponentDef, ComponentSnapshot, PlacedComponent, Rotation } from "@/models/types";
 
@@ -578,7 +579,7 @@ function moduleFace(c: C, p: PlacedComponent, d: ComponentDef, o: DrawOpts): voi
       break;
     }
     case "servo": {
-      const ang = (num(p, "angle", 90) - 90) * (Math.PI / 180);
+      const ang = ((o.snap?.aux.angle ?? num(p, "angle", 90)) - 90) * (Math.PI / 180);
       c.save();
       c.translate(x1 - 1, (y0 + y1) / 2);
       c.rotate(ang);
@@ -717,22 +718,64 @@ function logicFace(c: C, p: PlacedComponent, o: DrawOpts, x0: number, y0: number
   c.strokeRect(sx, sy, sw, sh);
 }
 
-function lcdFace(c: C, p: PlacedComponent, _o: DrawOpts, x0: number, y0: number, x1: number, _y1: number): void {
-  c.fillStyle = "#6fa23a";
-  c.fillRect(x0 + 1.5, y0 + 1.5, x1 - x0 - 3, 4.5);
-  c.fillStyle = "#1e3a10";
-  const l1 = str(p, "line1", "").padEnd(16).slice(0, 16);
-  const l2 = str(p, "line2", "").padEnd(16).slice(0, 16);
+function lcdFace(c: C, p: PlacedComponent, o: DrawOpts, x0: number, y0: number, x1: number, _y1: number): void {
+  const st = peekLcd(p.id);
+  const aux = o.snap?.aux;
+  const live = aux !== undefined; // a simulation snapshot exists
+  const powered = live && aux.powered === 1;
+  const lit = live && aux.backlight === 1;
+  const contrast = live ? (aux.contrast ?? 1) : 1;
+  const px = x0 + 1.5;
+  const py = y0 + 1.5;
+  const pw = x1 - x0 - 3;
+  const ph = 4.5;
+  c.fillStyle = !live ? "#6fa23a" : !powered ? "#2c3a22" : lit ? "#86c23f" : "#587a35";
+  c.fillRect(px, py, pw, ph);
   const cw = (x1 - x0 - 4) / 16;
-  [l1, l2].forEach((ln, row) => {
+  const ink = (a: number): string => `rgba(18,40,8,${a.toFixed(3)})`;
+  const initialised = st?.initialised === true;
+  for (let row = 0; row < 2; row++) {
     for (let i = 0; i < 16; i++) {
-      const ch = ln[i] ?? " ";
-      if (ch === " ") {
-        c.fillStyle = "rgba(30,58,16,0.12)";
-        c.fillRect(x0 + 2 + i * cw, y0 + 2.2 + row * 1.9, cw * 0.8, 1.4);
-      } else text(c, ch, x0 + 2 + i * cw + cw * 0.4, y0 + 2.9 + row * 1.9, 11, "center", "#1e3a10");
+      const cx = x0 + 2 + i * cw;
+      const cy = y0 + 2.2 + row * 1.9;
+      let code = 32;
+      let show = true;
+      if (!live) {
+        const ln = str(p, row === 0 ? "line1" : "line2", "").padEnd(16).slice(0, 16);
+        code = ln.charCodeAt(i) || 32;
+      } else if (!powered) show = false;
+      else if (!initialised) code = row === 0 ? -1 : 32; // power-on state: first row of solid blocks
+      else if (st && st.on) code = st.ddram[row * 40 + ((i + st.shift) % 40)] ?? 32;
+      else show = false;
+      if (!show) continue;
+      const a = live ? 0.15 + 0.85 * contrast : 1;
+      if (code === -1) {
+        c.fillStyle = ink(a * 0.85);
+        c.fillRect(cx, cy, cw * 0.8, 1.4);
+      } else if (code >= 0 && code < 8 && st) {
+        c.fillStyle = ink(a);
+        for (let r = 0; r < 8; r++) {
+          const bits = st.cgram[code * 8 + r] ?? 0;
+          for (let k = 0; k < 5; k++) if (bits & (1 << (4 - k))) c.fillRect(cx + k * (cw * 0.16), cy + r * 0.17, cw * 0.14, 0.15);
+        }
+      } else if (code === 32) {
+        c.fillStyle = ink(0.05 * a);
+        c.fillRect(cx, cy, cw * 0.8, 1.4);
+      } else {
+        const ch = code >= 33 && code <= 126 ? String.fromCharCode(code) : "▒";
+        text(c, ch, cx + cw * 0.4, cy + 0.7, 11, "center", ink(a));
+      }
     }
-  });
+  }
+  if (live && powered && st?.on && st.cursorOn) {
+    const addr = st.cursor & 0x7f;
+    const row = addr >= 0x40 ? 1 : 0;
+    const col = (addr >= 0x40 ? addr - 0x40 : addr) - st.shift;
+    if (col >= 0 && col < 16) {
+      c.fillStyle = ink(0.8);
+      c.fillRect(x0 + 2 + col * cw, y0 + 2.2 + row * 1.9 + 1.25, cw * 0.8, 0.18);
+    }
+  }
 }
 
 function sevenSegFace(c: C, o: DrawOpts, x0: number, y0: number, x1: number, _y1: number): void {

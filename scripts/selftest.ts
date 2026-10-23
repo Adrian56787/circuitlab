@@ -1,5 +1,12 @@
 import { Simulator } from "../src/engine/simulator";
 import { getDef } from "../src/models/catalog";
+import { orthogonalRoute } from "../src/models/geometry";
+import { compileSketch } from "../src/mcu/codegen";
+import { boardFor } from "../src/mcu/boards";
+import { McuIo, getIo } from "../src/mcu/io";
+import { McuRuntime, type Program } from "../src/mcu/runtime";
+import { peekLcd } from "../src/engine/lcdStore";
+import { templateById } from "../src/mcu/templates";
 import type { PlacedComponent, Wire } from "../src/models/types";
 
 let n = 0;
@@ -319,6 +326,412 @@ for (const [a, b, want] of [[5, 5, 0], [5, 0, 5], [0, 5, 5], [0, 0, 5]] as const
   const s = run([v, r, d, g], [wire(v, "p", r, "a"), wire(r, "b", d, "a"), wire(d, "com", g, "g"), wire(v, "n", g, "g")], 50);
   check("7-seg segment a brightness > 0.1", s.components[d.id]!.aux.b_a ?? 0, 0.5, 0.45);
   check("7-seg segment b dark", s.components[d.id]!.aux.b_b ?? 0, 0, 0.01);
+}
+
+// Bench supply current limit: 5 V / 0.1 A limit into 10 Ω → constant-current at 0.1 A (1 V); into 100 Ω stays a voltage source
+{
+  const mk = (rl: number): ReturnType<typeof run> => {
+    const v = comp("vdc", "V1", { voltage: 5, rint: 0.05, currentLimit: 0.1 });
+    const r = comp("resistor", "R1", { resistance: rl, powerRating: 5 });
+    const g = comp("ground", "GND");
+    return run([v, r, g], [wire(v, "p", r, "a"), wire(r, "b", g, "g"), wire(v, "n", g, "g")], 20);
+  };
+  const cc = mk(10);
+  check("CC mode: load current (mA)", Math.abs([...Object.values(cc.components)][0]!.current) * 1e3, 100, 2);
+  const cv = mk(100);
+  check("CV mode: load voltage (V)", Math.abs([...Object.values(cv.components)][0]!.voltage), 4.99, 0.03);
+}
+
+// Orthogonal router never folds back through a pin stub
+{
+  const bad = (pts: { x: number; y: number }[], a: { x: number; y: number }, da: { x: number; y: number }): boolean => {
+    const f = pts[1]!;
+    return Math.sign(f.x - a.x) * da.x + Math.sign(f.y - a.y) * da.y < 0;
+  };
+  let folds = 0;
+  const dirs = [{ x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 }];
+  for (const da of dirs) for (const db of dirs) for (const bx of [-6, -1, 0, 3, 8]) for (const by of [-5, 0, 2, 7]) {
+    const a = { x: 0, y: 0 };
+    const b = { x: bx, y: by };
+    const pts = orthogonalRoute(a, da, b, db);
+    const rev = [...pts].reverse();
+    if (bad(pts, a, da) || bad(rev, b, db)) folds++;
+  }
+  check("router: stub fold-backs", folds, 0, 0);
+}
+
+
+// ───────── extra device models ─────────
+const idOf = (s: ReturnType<Simulator["snapshot"]>, c: PlacedComponent): number => s.components[c.id]!.current;
+function simulate(comps: PlacedComponent[], wires: Wire[], seconds: number, dt: number, onStep?: (sim: Simulator) => void): Simulator {
+  const sim = new Simulator();
+  sim.compile(comps, wires);
+  while (sim.time < seconds - 1e-12) {
+    sim.step(dt);
+    onStep?.(sim);
+  }
+  return sim;
+}
+const netV = (sim: Simulator, c: PlacedComponent, pin: string): number => {
+  const s = sim.snapshot();
+  return s.netVoltage[s.pinNet[`${c.id}:${pin}`]!]!;
+};
+
+// JFET: Vgs = 0 → saturation near Idss; Vgs below pinch-off → off
+for (const [vg, want] of [[0, 0.0107], [-4, 0]] as const) {
+  const vdd = comp("vdc", "VDD", { voltage: 12, rint: 0 });
+  const vgs = comp("vdc", "VG", { voltage: vg, rint: 0 });
+  const rd = comp("resistor", "RD", { resistance: 470, powerRating: 5 });
+  const q = comp("jfet_n", "Q1", { idss: 0.01, vp: -3 });
+  const g = comp("ground", "GND");
+  const s = run([vdd, vgs, rd, q, g], [wire(vdd, "p", rd, "a"), wire(rd, "b", q, "d"), wire(q, "s", g, "g"), wire(vgs, "p", q, "g"), wire(vgs, "n", g, "g"), wire(vdd, "n", g, "g")], 50);
+  check(`JFET Vgs=${vg} drain current (A)`, Math.abs(idOf(s, rd)), want, 0.0008);
+}
+
+// SCR: gate pulse latches it on, stays on after the gate is released, drops out when the supply is interrupted
+{
+  const v = comp("vdc", "V1", { voltage: 12, rint: 0 });
+  const rl = comp("resistor", "RL", { resistance: 100, powerRating: 5 });
+  const q = comp("scr", "Q1");
+  const sw = comp("toggle_switch", "SW", { closed: true });
+  const vg = comp("vdc", "VG", { voltage: 5, rint: 0 });
+  const rg = comp("resistor", "RG", { resistance: 470 });
+  const g = comp("ground", "GND");
+  const comps = [v, rl, q, sw, vg, rg, g];
+  const ws = [wire(v, "p", rl, "a"), wire(rl, "b", q, "a"), wire(q, "k", g, "g"), wire(vg, "p", sw, "a"), wire(sw, "b", rg, "a"), wire(rg, "b", q, "g"), wire(vg, "n", g, "g"), wire(v, "n", g, "g")];
+  const sim = new Simulator();
+  sim.compile(comps, ws);
+  for (let i = 0; i < 100; i++) sim.step(1e-5);
+  check("SCR on after gate pulse: load current (A)", Math.abs(idOf(sim.snapshot(), rl)), 0.11, 0.01);
+  sw.params.closed = false;
+  sim.compile(comps, ws);
+  for (let i = 0; i < 100; i++) sim.step(1e-5);
+  check("SCR stays latched with gate released (A)", Math.abs(idOf(sim.snapshot(), rl)), 0.11, 0.01);
+  v.params.voltage = 0;
+  sim.compile(comps, ws);
+  for (let i = 0; i < 100; i++) sim.step(1e-5);
+  v.params.voltage = 12;
+  sim.compile(comps, ws);
+  for (let i = 0; i < 100; i++) sim.step(1e-5);
+  check("SCR stays off after current interruption (A)", Math.abs(idOf(sim.snapshot(), rl)), 0, 0.002);
+}
+
+// Triac: self-triggered from MT2 through 220 Ω conducts in both half-cycles
+{
+  const v = comp("vac", "V1", { amplitude: 20, frequency: 50, rint: 0.01 });
+  const t = comp("triac", "Q1");
+  const rl = comp("resistor", "RL", { resistance: 100, powerRating: 10 });
+  const rg = comp("resistor", "RG", { resistance: 220 });
+  const g = comp("ground", "GND");
+  let vmax = -Infinity;
+  let vmin = Infinity;
+  const sim = simulate([v, t, rl, rg, g], [wire(v, "p", t, "mt2"), wire(t, "mt1", rl, "a"), wire(rl, "b", g, "g"), wire(v, "p", rg, "a"), wire(rg, "b", t, "g"), wire(v, "n", g, "g")], 0.06, 1e-4, (sm) => {
+    if (sm.time > 0.02) {
+      const val = netV(sm, rl, "a");
+      vmax = Math.max(vmax, val);
+      vmin = Math.min(vmin, val);
+    }
+  });
+  void sim;
+  check("triac positive half-cycle peak (V)", vmax, 17, 3);
+  check("triac negative half-cycle peak (V)", vmin, -17, 3);
+}
+
+// Optocoupler: LED current switches the transistor
+for (const [vin, wantVc] of [[5, 0.15], [0, 5]] as const) {
+  const v = comp("vdc", "V1", { voltage: vin, rint: 0 });
+  const rled = comp("resistor", "R1", { resistance: 470 });
+  const vcc = comp("vdc", "V2", { voltage: 5, rint: 0 });
+  const rl = comp("resistor", "R2", { resistance: 1000 });
+  const u = comp("optocoupler", "U1");
+  const g = comp("ground", "GND");
+  const s = run([v, rled, vcc, rl, u, g], [wire(v, "p", rled, "a"), wire(rled, "b", u, "a"), wire(u, "k", g, "g"), wire(vcc, "p", rl, "a"), wire(rl, "b", u, "c"), wire(u, "e", g, "g"), wire(v, "n", g, "g"), wire(vcc, "n", g, "g")], 50);
+  check(`opto Vin=${vin} collector (V)`, vAt(s, u, "c"), wantVc, 0.2);
+}
+
+// Transformer: 2:1 step-down, 10 V peak in → ≈ 5 V peak across a 100 Ω secondary load; secondary is isolated
+{
+  const v = comp("vac", "V1", { amplitude: 10, frequency: 50, rint: 0.01 });
+  const t = comp("transformer", "T1", { turnsRatio: 0.5 });
+  const rl = comp("resistor", "RL", { resistance: 100, powerRating: 5 });
+  const g = comp("ground", "GND");
+  const g2 = comp("ground", "GND2");
+  let peak = 0;
+  simulate([v, t, rl, g, g2], [wire(v, "p", t, "p1"), wire(t, "p2", g, "g"), wire(v, "n", g, "g"), wire(t, "s1", rl, "a"), wire(rl, "b", t, "s2"), wire(t, "s2", g2, "g")], 0.08, 1e-4, (sm) => {
+    if (sm.time > 0.04) peak = Math.max(peak, Math.abs(netV(sm, t, "s1")));
+  });
+  check("transformer secondary peak (V)", peak, 4.8, 0.4);
+}
+
+// Servo: 2 ms pulses every 20 ms → 135°
+{
+  const v = comp("vdc", "V1", { voltage: 5, rint: 0 });
+  const sg = comp("sigen", "G1", { waveform: "pwm", amplitude: 2.5, offset: 2.5, frequency: 50, duty: 10, rint: 50 });
+  const m = comp("servo", "M1", { angle: 90 });
+  const g = comp("ground", "GND");
+  const sim = simulate([v, sg, m, g], [wire(v, "p", m, "vcc"), wire(m, "gnd", g, "g"), wire(sg, "p", m, "sig"), wire(sg, "n", g, "g"), wire(v, "n", g, "g")], 0.5, 5e-5);
+  check("servo angle for 2 ms pulse (deg)", sim.snapshot().components[m.id]!.aux.angle ?? -1, 135, 3);
+}
+
+// HC-SR04: 10 µs trigger → echo width = 2·d/343 (50 cm → 2.915 ms)
+{
+  const v = comp("vdc", "V1", { voltage: 5, rint: 0 });
+  const sg = comp("sigen", "G1", { waveform: "pwm", amplitude: 2.5, offset: 2.5, frequency: 10, duty: 0.01, rint: 50 });
+  const u = comp("hcsr04", "U1", { distanceCm: 50 });
+  const g = comp("ground", "GND");
+  let hiTime = 0;
+  simulate([v, sg, u, g], [wire(v, "p", u, "vcc"), wire(u, "gnd", g, "g"), wire(sg, "p", u, "trig"), wire(sg, "n", g, "g"), wire(v, "n", g, "g")], 0.09, 5e-6, (sm) => {
+    if (netV(sm, u, "echo") > 2.5) hiTime += 5e-6;
+  });
+  check("ultrasonic echo width (ms)", hiTime * 1e3, 2.915, 0.15);
+}
+
+// ───────── microcontroller language / runtime (no circuit) ─────────
+function runSketch(code: string, board = "arduino_uno", seconds = 0.5): string {
+  const r = compileSketch(code, board);
+  if (!r.ok) return `COMPILE ERROR line ${r.errors[0]!.line}: ${r.errors[0]!.message}`;
+  const io = new McuIo();
+  const rt = new McuRuntime((x) => new Function("R", r.js)(x) as Program, boardFor(board)!, io);
+  rt.restart(0);
+  for (let t = 1e-4; t <= seconds; t += 1e-4) rt.advance(t);
+  return io.log.replace(/\r/g, "").trim();
+}
+const lang = (name: string, body: string, want: string, board = "arduino_uno"): void => {
+  const got = runSketch(`void setup(){ Serial.begin(115200); }\nvoid loop(){ ${body} while(1){ delay(1000); } }`, board);
+  const ok = got === want;
+  if (!ok) failed++;
+  console.log(`${ok ? "PASS" : "FAIL"}  lang ${name}: got ${JSON.stringify(got)}${ok ? "" : `, want ${JSON.stringify(want)}`}`);
+};
+lang("byte wraps", "byte b = 250; b += 10; Serial.println(b);", "4");
+lang("16-bit int overflow (Uno)", "int x = 32767; x++; Serial.println(x);", "-32768");
+lang("32-bit int (ESP32)", "int x = 32767; x++; Serial.println(x);", "32768", "esp32");
+lang("unsigned long math", "unsigned long a = 4000000000UL; a += 500000000UL; Serial.println(a);", "205032704");
+lang("integer division truncates", "Serial.println(7 / 2); Serial.println(-7 / 2); Serial.println(7 % 3);", "3\n-3\n1");
+lang("float division", "Serial.println(7 / 2.0); Serial.println(1.0f / 3, 4);", "3.50\n0.3333");
+lang("compound shifts", "int a = 1; a <<= 4; a |= 3; Serial.println(a); Serial.println(a >> 2);", "19\n4");
+lang("HEX print", "Serial.println(255, HEX); Serial.println(5, BIN);", "FF\n101");
+lang("char arithmetic", "char c = 'a'; c += 2; Serial.println(c); Serial.println((int)c);", "c\n99");
+lang("String ops", 'String s = "ab"; s += 12; s += "z"; Serial.println(s); Serial.println(s.length()); Serial.println(s.indexOf("1")); s.toUpperCase(); Serial.println(s);', "ab12z\n5\n2\nAB12Z");
+lang("string + number concat", 'String s = "v=" + String(3.14159); Serial.println(s);', "v=3.14");
+lang("arrays and loops", "int a[5] = {1,2,3}; int sum = 0; for (int i = 0; i < 5; i++) sum += a[i] * 2; Serial.println(sum);", "12");
+lang("2D array", "int m[2][3]; for (int i=0;i<2;i++) for (int j=0;j<3;j++) m[i][j] = i*10+j; Serial.println(m[1][2]);", "12");
+lang("switch fallthrough", "int n = 2; switch (n) { case 1: Serial.print(\"a\"); case 2: Serial.print(\"b\"); case 3: Serial.print(\"c\"); break; default: Serial.print(\"d\"); } Serial.println();", "bc");
+lang("ternary + logic", "int x = 5; Serial.println(x > 3 && x < 9 ? 100 : 200); Serial.println(!x);", "100\n0");
+lang("do-while / break / continue", "int i = 0, s = 0; do { i++; if (i == 2) continue; if (i > 5) break; s += i; } while (true); Serial.println(s);", "13");
+lang("map / constrain", "Serial.println(map(512, 0, 1023, 0, 255)); Serial.println(constrain(15, 0, 10));", "127\n10");
+lang("math functions", "Serial.println(sqrt(16.0), 1); Serial.println(pow(2, 10), 0); Serial.println(abs(-5));", "4.0\n1024\n5");
+lang("sprintf", 'char buf[32]; sprintf(buf, "%d-%03d-%s-%c", 7, 5, "hi", 65); Serial.println(buf);', "7-005-hi-A");
+lang("bit helpers", "byte v = 0; bitSet(v, 3); bitWrite(v, 0, 1); Serial.println(v); Serial.println(bitRead(v, 3));", "9\n1");
+lang("sizeof", "int a[10]; Serial.println(sizeof(a)); Serial.println(sizeof(long));", "20\n4");
+lang("char array printing", 'char s[] = "hey"; Serial.println(s); Serial.println(strlen(s));', "hey\n3");
+lang("compile error reported", "int x = ;", "COMPILE ERROR line 2: Unexpected \";\".");
+{
+  const got = runSketch(`
+int fib(int n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }
+int counter() { static int c = 0; c++; return c; }
+const int N = 4;
+#define SQ(x) ((x)*(x))
+enum { A, B = 5, C };
+float avg(int a[], int n) { float s = 0; for (int i=0;i<n;i++) s += a[i]; return s / n; }
+void setup() { Serial.begin(9600); }
+void loop() {
+  Serial.println(fib(15));
+  counter(); counter();
+  Serial.println(counter());
+  int arr[N] = {2,4,6,8};
+  Serial.println(avg(arr, N), 1);
+  Serial.println(SQ(7));
+  Serial.println(C);
+  while (true) delay(1000);
+}`);
+  const ok = got === "610\n3\n5.0\n49\n6";
+  if (!ok) failed++;
+  console.log(`${ok ? "PASS" : "FAIL"}  lang functions/static/macro/enum: ${JSON.stringify(got)}`);
+}
+
+// ───────── microcontroller in a circuit ─────────
+function mcuBoard(kind: string, code: string, extra: (b: PlacedComponent, g: PlacedComponent) => { comps: PlacedComponent[]; wires: Wire[] }, params: Record<string, number | string | boolean> = {}) {
+  const b = comp(kind, "U1", { code, ...params });
+  const g = comp("ground", "GND");
+  const e = extra(b, g);
+  const gndPin = kind === "attiny85" ? "p4" : kind === "esp32" ? "gnd" : "gnd1";
+  return { b, g, comps: [b, g, ...e.comps], wires: [wire(b, gndPin, g, "g"), ...e.wires] };
+}
+
+// Blink: LED on D13 toggles every 500 ms
+{
+  const led = comp("led", "D1");
+  const r = comp("resistor", "R1", { resistance: 330 });
+  const m = mcuBoard("arduino_uno", templateById("blink")!.code, (b, g) => ({ comps: [led, r], wires: [wire(b, "d13", r, "a"), wire(r, "b", led, "a"), wire(led, "k", g, "g")] }));
+  const sim = new Simulator();
+  sim.compile(m.comps, m.wires);
+  const samples: [number, number][] = [];
+  while (sim.time < 2.05) {
+    sim.step(1e-3);
+    if (sim.time > 0.2 && Math.abs(((sim.time + 0.25) % 0.5) - 0.0) < 1e-3) samples.push([sim.time, netV(sim, led, "a")]);
+  }
+  // sample mid-phase values
+  const hi = (t: number): number => { const x = samples.find(([ts]) => Math.abs(ts - t) < 1.5e-3); return x ? x[1] : NaN; };
+  check("blink: LED anode lit at t=0.25 s (V)", hi(0.25), 1.9, 0.4);
+  check("blink: LED anode dark at t=0.75 s (V)", hi(0.75), 0, 0.1);
+  check("blink: LED anode lit at t=1.25 s (V)", hi(1.25), 1.9, 0.4);
+}
+
+// Serial print timing + button input with pull-up
+{
+  const sw = comp("toggle_switch", "SW", { closed: false });
+  const led = comp("led", "D1");
+  const r = comp("resistor", "R1", { resistance: 330 });
+  const m = mcuBoard("arduino_uno", templateById("button")!.code, (b, g) => ({ comps: [sw, led, r], wires: [wire(b, "d2", sw, "a"), wire(sw, "b", g, "g"), wire(b, "d13", r, "a"), wire(r, "b", led, "a"), wire(led, "k", g, "g")] }));
+  const sim = new Simulator();
+  sim.compile(m.comps, m.wires);
+  while (sim.time < 0.05) sim.step(1e-3);
+  check("button released: LED off (V)", netV(sim, led, "a"), 0, 0.1);
+  sw.params.closed = true;
+  sim.compile(m.comps, m.wires);
+  while (sim.time < 0.1) sim.step(1e-3);
+  check("button pressed: LED on (V)", netV(sim, led, "a"), 1.9, 0.4);
+}
+
+// PWM: analogWrite(9, 64) → duty 25 % → mean ≈ 1.25 V
+{
+  const m = mcuBoard("arduino_uno", "void setup(){ pinMode(9, OUTPUT); analogWrite(9, 64); } void loop(){}", (b, g) => {
+    const rl = comp("resistor", "RL", { resistance: 10000 });
+    return { comps: [rl], wires: [wire(b, "d9", rl, "a"), wire(rl, "b", g, "g")] };
+  });
+  const sim = new Simulator();
+  sim.compile(m.comps, m.wires);
+  let acc = 0;
+  let tt = 0;
+  while (sim.time < 0.1) {
+    const t0 = sim.time;
+    sim.step(1e-3);
+    if (t0 > 0.02) {
+      acc += netV(sim, m.comps[2]!, "a") * (sim.time - t0);
+      tt += sim.time - t0;
+    }
+  }
+  check("PWM 25 % mean voltage (V)", acc / tt, 1.25, 0.1);
+}
+
+// ADC: potentiometer midpoint → analogRead ≈ 512
+{
+  const code = "void setup(){ Serial.begin(9600); } void loop(){ Serial.println(analogRead(A0)); delay(100); }";
+  const r1 = comp("resistor", "R1", { resistance: 10000 });
+  const r2 = comp("resistor", "R2", { resistance: 10000 });
+  const m = mcuBoard("arduino_uno", code, (b, g) => ({ comps: [r1, r2], wires: [wire(b, "5v", r1, "a"), wire(r1, "b", r2, "a"), wire(r1, "b", b, "a0"), wire(r2, "b", g, "g")] }));
+  const sim = new Simulator();
+  sim.compile(m.comps, m.wires);
+  while (sim.time < 0.35) sim.step(1e-3);
+  const line = getIo(m.b.id).log.trim().split("\n")[0] ?? "";
+  check("analogRead at mid-divider", Number(line), 512, 4);
+}
+
+// HC-SR04 + sonar template: prints ≈ 50.0 cm
+{
+  const us = comp("hcsr04", "S1", { distanceCm: 50 });
+  const m = mcuBoard("arduino_uno", templateById("sonar")!.code, (b, g) => ({ comps: [us], wires: [wire(b, "5v", us, "vcc"), wire(us, "gnd", g, "g"), wire(b, "d7", us, "trig"), wire(b, "d8", us, "echo")] }));
+  const sim = new Simulator();
+  sim.compile(m.comps, m.wires);
+  while (sim.time < 0.7) sim.step(1e-3);
+  const lines = getIo(m.b.id).log.trim().split("\n").filter((l) => l.startsWith("distance"));
+  const v = Number((lines[1] ?? "").replace(/[^0-9.]/g, ""));
+  check("sonar sketch: measured distance (cm)", v, 50, 1.5);
+}
+
+// Servo sweep: angle changes and stays within range
+{
+  const sv = comp("servo", "M1");
+  const m = mcuBoard("arduino_uno", templateById("servo")!.code, (b, g) => ({ comps: [sv], wires: [wire(b, "5v", sv, "vcc"), wire(sv, "gnd", g, "g"), wire(b, "d9", sv, "sig")] }));
+  const sim = new Simulator();
+  sim.compile(m.comps, m.wires);
+  const angles: number[] = [];
+  while (sim.time < 1.5) {
+    sim.step(1e-3);
+    if (Math.round(sim.time * 1000) % 100 === 0) angles.push(sim.snapshot().components[sv.id]!.aux.angle ?? -1);
+  }
+  const lo = Math.min(...angles);
+  const hi = Math.max(...angles);
+  check("servo sweep: angle range spans (deg)", hi - lo, 150, 60);
+}
+
+// LCD: "Hello, CircuitLab" appears through the real 4-bit bus protocol
+{
+  const lcd = comp("lcd1602", "LCD1", { line1: "", line2: "" });
+  const r = comp("resistor", "RB", { resistance: 220 });
+  const m = mcuBoard("arduino_uno", templateById("lcd")!.code, (b, g) => ({
+    comps: [lcd, r],
+    wires: [
+      wire(b, "5v", lcd, "vdd"), wire(lcd, "vss", g, "g"), wire(lcd, "v0", g, "g"), wire(lcd, "rw", g, "g"),
+      wire(b, "d12", lcd, "rs"), wire(b, "d11", lcd, "e"),
+      wire(b, "d5", lcd, "d4"), wire(b, "d4", lcd, "d5"), wire(b, "d3", lcd, "d6"), wire(b, "d2", lcd, "d7"),
+      wire(b, "5v", r, "a"), wire(r, "b", lcd, "a"), wire(lcd, "k", g, "g"),
+    ],
+  }));
+  const sim = new Simulator();
+  sim.compile(m.comps, m.wires);
+  while (sim.time < 0.3) sim.step(1e-3);
+  const st = peekLcd(lcd.id);
+  const line1 = st ? String.fromCharCode(...Array.from(st.ddram.slice(0, 17))) : "";
+  const ok = line1 === "Hello, CircuitLab";
+  if (!ok) failed++;
+  console.log(`${ok ? "PASS" : "FAIL"}  LCD shows text via bus protocol: ${JSON.stringify(line1)}`);
+  const line2 = st ? String.fromCharCode(...Array.from(st.ddram.slice(40, 44))) : "";
+  const ok2 = line2 === "t = ";
+  if (!ok2) failed++;
+  console.log(`${ok2 ? "PASS" : "FAIL"}  LCD second line: ${JSON.stringify(line2)}`);
+}
+
+// ATtiny85 and ESP32 blink
+for (const [kind, pinId, gnd] of [["attiny85", "p6", "p4"], ["esp32", "r_g2", "gnd"]] as const) {
+  const led = comp("led", "D1");
+  const r = comp("resistor", "R1", { resistance: 330 });
+  const b = comp(kind, "U1", { code: templateById("blink")!.code });
+  const g = comp("ground", "GND");
+  const vcc = comp("vdc", "V1", { voltage: 5, rint: 0.05 });
+  const ws = [wire(b, gnd, g, "g"), wire(b, pinId, r, "a"), wire(r, "b", led, "a"), wire(led, "k", g, "g")];
+  const comps = [b, g, led, r];
+  if (kind === "attiny85") {
+    comps.push(vcc);
+    ws.push(wire(vcc, "p", b, "p8"), wire(vcc, "n", g, "g"));
+  }
+  const sim = new Simulator();
+  sim.compile(comps, ws);
+  while (sim.time < 0.3) sim.step(1e-3);
+  check(`${kind} blink: LED on at t=0.3 s (V)`, netV(sim, led, "a"), 1.9, 0.5);
+  while (sim.time < 0.75) sim.step(1e-3);
+  check(`${kind} blink: LED off at t=0.75 s (V)`, netV(sim, led, "a"), 0, 0.1);
+}
+
+// Overload: shorting a driven output to ground destroys the board
+{
+  const m = mcuBoard("arduino_uno", "void setup(){ pinMode(13, OUTPUT); digitalWrite(13, HIGH); } void loop(){}", (b, g) => ({ comps: [], wires: [wire(b, "d13", g, "g")] }));
+  const sim = new Simulator();
+  sim.compile(m.comps, m.wires);
+  while (sim.time < 1.0) sim.step(1e-3);
+  check("shorted GPIO burns the MCU (burned flag)", sim.snapshot().components[m.b.id]!.burned ? 1 : 0, 1, 0);
+}
+
+for (const pr of PRESETS.filter((q) => /^(uno|esp32|attiny)-/.test(q.id))) {
+  const data = pr.build();
+  const sim = new Simulator();
+  sim.compile(data.components, data.wires);
+  while (sim.time < 1.5) sim.step(1e-3);
+  const snap = sim.snapshot();
+  const burned = data.components.filter((c) => snap.components[c.id]?.burned).map((c) => c.label);
+  const mcu = data.components.find((c) => getDef(c.kind).sim === "mcu")!;
+  const st = getIo(mcu.id).status;
+  check(`preset ${pr.id}: nothing burned`, burned.length, 0, 0);
+  check(`preset ${pr.id}: sketch running (${st.kind} ${st.message})`, st.kind === "running" ? 1 : 0, 1, 0);
+  if (pr.id === "uno-pot") check("preset uno-pot: serial output present", getIo(mcu.id).log.includes("raw=") ? 1 : 0, 1, 0);
+  if (pr.id === "uno-sonar") {
+    const m = /distance: ([0-9.]+) cm/.exec(getIo(mcu.id).log);
+    check("preset uno-sonar: measured ~80 cm", m ? Number(m[1]) : -1, 80, 2);
+  }
+  if (pr.id === "uno-lcd") {
+    const l = peekLcd(data.components.find((c) => c.kind === "lcd1602")!.id);
+    check("preset uno-lcd: row 0 starts with 'Hello'", l && String.fromCharCode(...l.ddram.slice(0, 5)) === "Hello" ? 1 : 0, 1, 0);
+  }
 }
 
 console.log(failed === 0 ? "\nALL PASSED" : `\n${failed} FAILED`);

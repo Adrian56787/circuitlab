@@ -51,6 +51,10 @@ interface CircuitState {
   setLabel: (id: string, label: string) => void;
   duplicateSelection: () => void;
   deleteSelection: () => void;
+  copySelection: () => boolean;
+  cutSelection: () => void;
+  paste: () => void;
+  nudgeSelection: (dx: number, dy: number) => void;
 
   // wires
   addWire: (from: PinRef, to: PinRef, color?: WireColor, routing?: WireRouting) => string | null;
@@ -76,6 +80,9 @@ const snapshotOf = (s: Pick<CircuitState, "components" | "wires">): Snapshot => 
 });
 
 let lastCoalesce: { key: string; at: number } | null = null;
+
+/** In-app clipboard (components + the wires fully inside the copied set). */
+let clipboard: { components: PlacedComponent[]; wires: Wire[]; pastes: number } | null = null;
 
 function nextLabel(components: PlacedComponent[], kind: string): string {
   const prefix = getDef(kind).prefix;
@@ -269,6 +276,68 @@ export const useCircuitStore = create<CircuitState>((set, get) => ({
       selection: { components: [], wires: [] },
       revision: s.revision + 1,
     }));
+  },
+
+  copySelection: () => {
+    const { selection, components, wires } = get();
+    if (selection.components.length === 0) return false;
+    const ids = new Set(selection.components);
+    clipboard = {
+      components: components.filter((c) => ids.has(c.id)).map((c) => ({ ...c, params: { ...c.params } })),
+      wires: wires.filter((w) => ids.has(w.from.componentId) && ids.has(w.to.componentId)).map((w) => ({ ...w })),
+      pastes: 0,
+    };
+    return true;
+  },
+
+  cutSelection: () => {
+    if (get().copySelection()) get().deleteSelection();
+  },
+
+  paste: () => {
+    if (!clipboard || clipboard.components.length === 0) return;
+    clipboard.pastes += 1;
+    const off = 2 * clipboard.pastes;
+    get().checkpoint();
+    const idMap = new Map<string, string>();
+    let working = get().components;
+    const copies: PlacedComponent[] = [];
+    for (const src of clipboard.components) {
+      const nid = uid("c");
+      idMap.set(src.id, nid);
+      const copy: PlacedComponent = {
+        ...src,
+        id: nid,
+        x: src.x + off,
+        y: src.y + off,
+        params: { ...src.params },
+        label: nextLabel(working, src.kind),
+      };
+      working = [...working, copy];
+      copies.push(copy);
+    }
+    const wireCopies: Wire[] = clipboard.wires.map((w) => ({
+      ...w,
+      id: uid("w"),
+      from: { ...w.from, componentId: idMap.get(w.from.componentId)! },
+      to: { ...w.to, componentId: idMap.get(w.to.componentId)! },
+    }));
+    set((s) => ({
+      components: [...s.components, ...copies],
+      wires: [...s.wires, ...wireCopies],
+      selection: { components: copies.map((c) => c.id), wires: [] },
+      revision: s.revision + 1,
+    }));
+  },
+
+  nudgeSelection: (dx, dy) => {
+    const ids = get().selection.components;
+    if (ids.length === 0) return;
+    // coalesce key-repeat into one undo step
+    const now = Date.now();
+    if (!(lastCoalesce && lastCoalesce.key === "nudge" && now - lastCoalesce.at < 600)) get().checkpoint();
+    lastCoalesce = { key: "nudge", at: now };
+    get().moveComponents(ids, dx, dy);
   },
 
   addWire: (from, to, color = "auto", routing = "orthogonal") => {

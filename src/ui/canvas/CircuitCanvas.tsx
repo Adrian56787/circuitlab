@@ -15,6 +15,7 @@ import {
 } from "@/models/geometry";
 import { GRID_PX, type PinRef, type PlacedComponent, type Vec2 } from "@/models/types";
 import { formatEng } from "@/models/units";
+import { exportJson } from "@/storage/exporters";
 import { useCircuitStore } from "@/store/circuitStore";
 import { useSimStore } from "@/store/simulationStore";
 import { useUiStore } from "@/store/uiStore";
@@ -648,6 +649,22 @@ export function CircuitCanvas(): React.JSX.Element {
       } else if (mod && k === "d") {
         e.preventDefault();
         cs.duplicateSelection();
+      } else if (mod && k === "c") {
+        e.preventDefault();
+        cs.copySelection();
+      } else if (mod && k === "x") {
+        e.preventDefault();
+        cs.cutSelection();
+      } else if (mod && k === "v") {
+        e.preventDefault();
+        cs.paste();
+      } else if (mod && k === "s") {
+        e.preventDefault();
+        exportJson(cs.toData());
+      } else if (!mod && k.startsWith("arrow")) {
+        e.preventDefault();
+        const step = e.shiftKey ? 5 : 1;
+        cs.nudgeSelection(k === "arrowleft" ? -step : k === "arrowright" ? step : 0, k === "arrowup" ? -step : k === "arrowdown" ? step : 0);
       } else if (!mod && (k === "delete" || k === "backspace")) {
         e.preventDefault();
         cs.deleteSelection();
@@ -667,8 +684,6 @@ export function CircuitCanvas(): React.JSX.Element {
         ui.setPlacing(null);
         ui.setTool("select");
         cs.clearSelection();
-      } else if (k === " " || (!mod && k === "p" && false)) {
-        /* reserved */
       } else {
         return;
       }

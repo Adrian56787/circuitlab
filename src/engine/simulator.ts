@@ -1,7 +1,8 @@
 import { CATALOG } from "@/models/catalog";
 import { pinKey } from "@/models/types";
 import type { ComponentSnapshot, LogicLevel, PlacedComponent, SimSnapshot, Wire } from "@/models/types";
-import { createDevice, Device, DeviceState, VoltageSourceDevice, type ProbeStore, type StepCtx } from "./devices";
+import { Device, DeviceState, type ProbeStore, type StepCtx } from "./devices";
+import { createDevice } from "./factory";
 import { Stamper, solveInPlace } from "./mna";
 import { buildNetlist, type Netlist } from "./netlist";
 
@@ -92,7 +93,7 @@ export class Simulator {
       const dev = createDevice(c, def, nodes, st);
       dev.branchBase = branchCount;
       branchCount += dev.branches;
-      if (dev instanceof VoltageSourceDevice) dev.branchIndexAbs = n + dev.branchBase;
+      dev.branchIndexAbs = n + dev.branchBase;
       this.devices.push(dev);
     }
 
@@ -124,7 +125,15 @@ export class Simulator {
   }
 
   /** Advance one step of length dt. Returns false if the matrix was singular. */
-  step(dt: number, dc = false): boolean {
+  step(dtWanted: number, dc = false): boolean {
+    let dt = dtWanted;
+    if (!dc) {
+      // Land exactly on scheduled device events (MCU wake-ups, ultrasonic echo edges …).
+      for (const d of this.devices) {
+        const lim = d.maxStep(this.time);
+        if (lim < dt) dt = Math.max(lim, 1e-9);
+      }
+    }
     this.lastDt = dc ? 0 : dt;
     const ctx: StepCtx = { t: this.time + dt, dt: dc ? 0 : dt, dc, srcScale: 1, homotopy: 1 };
     const size = this.base.size;
@@ -209,21 +218,22 @@ export class Simulator {
    */
   advance(simSeconds: number, baseDt: number, maxSteps = 400, budgetMs = 10): AdvanceResult {
     if (simSeconds <= 0) return { steps: 0, simulated: 0 };
-    const steps = Math.min(maxSteps, Math.max(1, Math.ceil(simSeconds / baseDt)));
-    const dt = simSeconds / steps;
+    const planned = Math.min(maxSteps, Math.max(1, Math.ceil(simSeconds / baseDt)));
+    const dt = simSeconds / planned;
     const start = performance.now();
+    const t0 = this.time;
     let done = 0;
-    for (; done < steps; done++) {
-      if (!this.step(dt)) {
+    // Device events can shorten individual steps, so loop on simulated time rather than step count.
+    while (this.time - t0 < simSeconds - 1e-12 && done < maxSteps * 4) {
+      const remaining = simSeconds - (this.time - t0);
+      if (!this.step(Math.min(dt, remaining))) {
         done++;
         break;
       }
-      if (performance.now() - start > budgetMs) {
-        done++;
-        break;
-      }
+      done++;
+      if ((done & 3) === 0 && performance.now() - start > budgetMs) break;
     }
-    return { steps: done, simulated: done * dt };
+    return { steps: done, simulated: this.time - t0 };
   }
 
   /** Solve the DC operating point without advancing time (capacitors open, inductors shorted). */

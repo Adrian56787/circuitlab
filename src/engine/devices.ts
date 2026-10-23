@@ -22,6 +22,8 @@ export class DeviceState {
   heat = 0;
   n: Record<string, number> = {};
   f: Record<string, boolean> = {};
+  /** Arbitrary persistent object (e.g. a microcontroller's running program). */
+  obj: unknown = null;
 }
 
 export class ProbeBuffer {
@@ -53,13 +55,13 @@ export class ProbeBuffer {
 
 export type ProbeStore = Map<string, ProbeBuffer>;
 
-const VT = 0.025852; // thermal voltage at 300 K
-const GMIN = 1e-12;
-const G_OPEN = 1e-12;
+export const VT = 0.025852; // thermal voltage at 300 K
+export const GMIN = 1e-12;
+export const G_OPEN = 1e-12;
 const G_CLOSED = 1e3;
 
-const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
-const nv = (x: Float64Array, node: number): number => (node < 0 ? 0 : x[node]!);
+export const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
+export const nv = (x: Float64Array, node: number): number => (node < 0 ? 0 : x[node]!);
 
 function expl(x: number): number {
   return x <= 40 ? Math.exp(x) : Math.exp(40) * (1 + x - 40);
@@ -68,15 +70,15 @@ function dexpl(x: number): number {
   return x <= 40 ? Math.exp(x) : Math.exp(40);
 }
 
-const numParam = (p: Params, key: string, fallback: number): number => {
+export const numParam = (p: Params, key: string, fallback: number): number => {
   const v = p[key];
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 };
-const strParam = (p: Params, key: string, fallback: string): string => {
+export const strParam = (p: Params, key: string, fallback: string): string => {
   const v = p[key];
   return typeof v === "string" ? v : fallback;
 };
-const boolParam = (p: Params, key: string): boolean => p[key] === true;
+export const boolParam = (p: Params, key: string): boolean => p[key] === true;
 
 // ───────────────────────── base device ─────────────────────────
 
@@ -84,6 +86,8 @@ export abstract class Device {
   nonlinear = false;
   branches = 0;
   branchBase = 0;
+  /** Absolute row of this device's first branch variable (set by the simulator). */
+  branchIndexAbs = 0;
   /** Heat gained per second per unit of overload (stress − 1). */
   thermalGain = 3;
   protected readonly p: Params;
@@ -103,6 +107,13 @@ export abstract class Device {
     return i < 0 ? -1 : this.nodes[i]!;
   }
 
+  /**
+   * Largest step the solver may take from time `t` so that the device's next scheduled event
+   * (a microcontroller wake-up, a pulse edge …) lands exactly on a step boundary.
+   */
+  maxStep(_t: number): number {
+    return Infinity;
+  }
   /** Linear / companion stamps, called once per time-step. */
   abstract stamp(s: Stamper, ctx: StepCtx): void;
   /** Nonlinear stamps, called every Newton iteration. Returns true if voltage limiting altered the point. */
@@ -364,20 +375,37 @@ export class VoltageSourceDevice extends Device {
   private readonly rint: number;
   private readonly pN: number;
   private readonly nN: number;
+  /** Bench supply with constant-current limiting: smooth tanh output characteristic. */
+  private readonly cc: boolean;
+  private readonly ilim: number;
   constructor(comp: PlacedComponent, def: ComponentDef, nodes: number[], st: DeviceState) {
     super(comp, def, nodes, st);
     this.rint = Math.max(0, numParam(comp.params, "rint", 0));
     this.pN = nodes[0]!;
     this.nN = nodes[1]!;
     this.thermalGain = 0;
-    this.branches = this.rint < 1e-3 ? 1 : 0;
+    this.ilim = numParam(comp.params, "currentLimit", Infinity);
+    this.cc = comp.kind === "vdc" && Number.isFinite(this.ilim) && this.ilim > 0 && this.rint >= 1e-3;
+    this.nonlinear = this.cc;
+    this.branches = this.cc ? 0 : this.rint < 1e-3 ? 1 : 0;
   }
   private value(ctx: StepCtx): number {
     return sourceValue(this.comp, ctx.t) * ctx.srcScale;
   }
+  private get g(): number {
+    return 1 / Math.max(this.rint, 1e-3);
+  }
+  /** Current delivered out of the + terminal at terminal voltage vd. */
+  private ccOut(vt: number, vd: number): { i: number; slope: number } {
+    const u = (this.g * (vt - vd)) / this.ilim;
+    const th = Math.tanh(u);
+    // small slope floor keeps Newton from stalling on the flat (saturated) part of the curve
+    return { i: this.ilim * th, slope: this.g * (1 - th * th + 2e-3) };
+  }
   stamp(s: Stamper, ctx: StepCtx): void {
     const v = this.value(ctx);
     this.st.n.v = v;
+    if (this.cc) return;
     if (this.branches === 1) {
       s.voltageSource(this.branchBase, this.pN, this.nN, v);
     } else {
@@ -385,18 +413,47 @@ export class VoltageSourceDevice extends Device {
       s.branch(this.pN, this.nN, g, -g * v);
     }
   }
+  override stampNL(s: Stamper, x: Float64Array, ctx: StepCtx): boolean {
+    if (!this.cc) return false;
+    const vt = this.st.n.v ?? 0;
+    const vnew = nv(x, this.pN) - nv(x, this.nN);
+    // Limit the terminal-voltage step to a few knee widths so Newton can't leap across the
+    // sharp current-limit corner (knee width = Ilim / g).
+    const lim = Math.max(0.3, (4 * this.ilim) / this.g);
+    if (this.st.n.tstep !== ctx.t) {
+      this.st.n.tstep = ctx.t;
+      this.st.n.damp = 1;
+      this.st.n.dir = 0;
+    }
+    const vold = this.st.n.vd ?? vnew;
+    const raw = vnew - vold;
+    const dir = Math.sign(raw);
+    // Damp when the iteration ping-pongs across the sharp current-limit knee.
+    let damp = this.st.n.damp ?? 1;
+    if (dir !== 0 && dir === -(this.st.n.dir ?? 0)) damp = Math.max(damp * 0.5, 1 / 128);
+    else damp = Math.min(1, damp * 1.3);
+    this.st.n.damp = damp;
+    if (dir !== 0) this.st.n.dir = dir;
+    const step = Math.max(-lim, Math.min(lim, raw * damp));
+    const vd = vold + step;
+    this.st.n.vd = vd;
+    const { i, slope } = this.ccOut(vt, vd);
+    // current p→n through the element = −i_out; linearised about vd
+    s.branch(this.pN, this.nN, slope, -i - slope * vd);
+    return Math.abs(vd - vnew) > 1e-7 + 1e-5 * Math.abs(vnew);
+  }
   pinCurrents(x: Float64Array): number[] {
     let i: number;
-    if (this.branches === 1) i = x[this.branchIndexAbs]!;
+    if (this.cc) i = -this.ccOut(this.st.n.v ?? 0, nv(x, this.pN) - nv(x, this.nN)).i;
+    else if (this.branches === 1) i = x[this.branchIndexAbs]!;
     else i = (nv(x, this.pN) - nv(x, this.nN) - (this.st.n.v ?? 0)) / this.rint;
     return [i, -i];
   }
-  /** Absolute row of the branch variable, injected by the simulator. */
-  branchIndexAbs = 0;
   override aux(x: Float64Array): Record<string, number> {
     const i = this.pinCurrents(x)[0]!;
-    const limit = numParam(this.p, "currentLimit", Infinity);
-    return { supplied: -i, setpoint: this.st.n.v ?? 0, limited: -i > limit ? 1 : 0 };
+    // constant-current mode once the output is within 3 % of the limit
+    const limited = this.cc ? (-i >= this.ilim * 0.97 ? 1 : 0) : 0;
+    return { supplied: -i, setpoint: this.st.n.v ?? 0, limited };
   }
 }
 
@@ -476,7 +533,7 @@ export class RelayDevice extends Device {
 
 // ───────────────────────── diodes ─────────────────────────
 
-function pnjlim(vnew: number, vold: number, vt: number, vcrit: number): number {
+export function pnjlim(vnew: number, vold: number, vt: number, vcrit: number): number {
   if (vnew > vcrit && Math.abs(vnew - vold) > 2 * vt) {
     if (vold > 0) {
       const arg = 1 + (vnew - vold) / vt;
@@ -487,7 +544,7 @@ function pnjlim(vnew: number, vold: number, vt: number, vcrit: number): number {
   return vnew;
 }
 
-class Junction {
+export class Junction {
   readonly is: number;
   readonly nvt: number;
   readonly vcrit: number;
@@ -867,7 +924,7 @@ export class MosfetDevice extends Device {
  * Behavioural nonlinear block with a numerical Jacobian: `fn` maps terminal voltages to
  * currents flowing INTO each terminal.
  */
-abstract class BehaviouralDevice extends Device {
+export abstract class BehaviouralDevice extends Device {
   /** Homotopy level of the current Newton solve (1 = the real circuit). */
   protected h = 1;
   /** Behavioural blocks can be solved by continuation when plain Newton fails. */
@@ -1282,47 +1339,3 @@ export class NullDevice extends Device {
 }
 
 export class GroundDevice extends NullDevice {}
-
-// ───────────────────────── factory ─────────────────────────
-
-export function createDevice(comp: PlacedComponent, def: ComponentDef, nodes: number[], st: DeviceState): Device {
-  switch (def.sim) {
-    case "ground":
-      return new GroundDevice(comp, def, nodes, st);
-    case "resistor":
-    case "load":
-      return new ResistorDevice(comp, def, nodes, st);
-    case "potentiometer":
-      return new PotentiometerDevice(comp, def, nodes, st);
-    case "capacitor":
-      return new CapacitorDevice(comp, def, nodes, st);
-    case "inductor":
-      return new InductorDevice(comp, def, nodes, st);
-    case "vsource":
-      return new VoltageSourceDevice(comp, def, nodes, st);
-    case "switch":
-      return new SwitchDevice(comp, def, nodes, st);
-    case "relay":
-      return new RelayDevice(comp, def, nodes, st);
-    case "diode":
-      return new DiodeDevice(comp, def, nodes, st);
-    case "diodeArray":
-      return new DiodeArrayDevice(comp, def, nodes, st);
-    case "bjt":
-      return new BjtDevice(comp, def, nodes, st);
-    case "mosfet":
-      return new MosfetDevice(comp, def, nodes, st);
-    case "opamp":
-      return new OpAmpDevice(comp, def, nodes, st);
-    case "regulator":
-      return new RegulatorDevice(comp, def, nodes, st);
-    case "gate":
-      return new GateDevice(comp, def, nodes, st);
-    case "timer555":
-      return new Timer555Device(comp, def, nodes, st);
-    case "meter":
-      return new MeterDevice(comp, def, nodes, st);
-    default:
-      return new NullDevice(comp, def, nodes, st);
-  }
-}

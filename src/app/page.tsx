@@ -2,11 +2,12 @@
 
 import { useEffect } from "react";
 import { PRESETS } from "@/presets/presets";
+import { restoreAutosave, startAutosave } from "@/storage/autosave";
 import { useCircuitStore } from "@/store/circuitStore";
 import { CircuitCanvas } from "@/ui/canvas/CircuitCanvas";
 import { Inspector } from "@/ui/panels/Inspector";
 import { ResistorCalc } from "@/ui/panels/ResistorCalc";
-import { ScopePanel } from "@/ui/panels/ScopePanel";
+import { Dock } from "@/ui/panels/Dock";
 import { Sidebar } from "@/ui/panels/Sidebar";
 import { StatusBar, Toasts } from "@/ui/panels/StatusBar";
 import { Toolbar, fitView } from "@/ui/panels/Toolbar";
@@ -16,9 +17,10 @@ export default function Page(): React.JSX.Element {
   // Start with a small working circuit so the canvas is never empty on first load.
   useEffect(() => {
     if (useCircuitStore.getState().components.length === 0) {
-      useCircuitStore.getState().load(PRESETS[0]!.build());
+      if (!restoreAutosave()) useCircuitStore.getState().load(PRESETS[0]!.build());
       requestAnimationFrame(fitView);
     }
+    return startAutosave();
   }, []);
 
   return (
@@ -31,7 +33,7 @@ export default function Page(): React.JSX.Element {
           <div id="canvas-host" className="relative min-h-0 flex-1">
             <CircuitCanvas />
           </div>
-          <ScopePanel />
+          <Dock />
         </main>
         <Inspector />
       </div>

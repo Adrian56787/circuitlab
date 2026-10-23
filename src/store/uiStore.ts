@@ -14,6 +14,9 @@ interface UiState {
   wireRouting: WireRouting;
   inspectorOpen: boolean;
   scopeOpen: boolean;
+  dockTab: "instruments" | "code" | "serial";
+  dockHeight: number;
+  mcuId: string | null;
   colorCalcOpen: boolean;
   toast: { id: number; text: string; tone: "info" | "warn" | "error" } | null;
 
@@ -25,6 +28,10 @@ interface UiState {
   setWireRouting: (r: WireRouting) => void;
   setInspectorOpen: (v: boolean) => void;
   setScopeOpen: (v: boolean) => void;
+  setDockTab: (t: "instruments" | "code" | "serial") => void;
+  setDockHeight: (h: number) => void;
+  /** Open the dock on the code editor for a microcontroller. */
+  openCode: (id: string) => void;
   setColorCalcOpen: (v: boolean) => void;
   notify: (text: string, tone?: "info" | "warn" | "error") => void;
 }
@@ -49,6 +56,9 @@ export const useUiStore = create<UiState>((set) => ({
   wireRouting: "orthogonal",
   inspectorOpen: true,
   scopeOpen: false,
+  dockTab: "instruments",
+  dockHeight: 280,
+  mcuId: null,
   colorCalcOpen: false,
   toast: null,
 
@@ -60,6 +70,9 @@ export const useUiStore = create<UiState>((set) => ({
   setWireRouting: (wireRouting) => set({ wireRouting }),
   setInspectorOpen: (inspectorOpen) => set({ inspectorOpen }),
   setScopeOpen: (scopeOpen) => set({ scopeOpen }),
+  setDockTab: (dockTab) => set({ dockTab }),
+  setDockHeight: (h) => set({ dockHeight: Math.round(Math.min(640, Math.max(140, h))) }),
+  openCode: (mcuId) => set({ mcuId, dockTab: "code", scopeOpen: true }),
   setColorCalcOpen: (colorCalcOpen) => set({ colorCalcOpen }),
   notify: (text, tone = "info") => set({ toast: { id: ++toastId, text, tone } }),
 }));

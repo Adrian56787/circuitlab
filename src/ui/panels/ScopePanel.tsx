@@ -1,6 +1,5 @@
 "use client";
 
-import { ChevronDown, ChevronUp } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { probes } from "@/engine/probes";
 import { formatEng } from "@/models/units";
@@ -62,9 +61,31 @@ function ScopeScreen({ id, logic }: { id: string; logic: boolean }): React.JSX.E
     const out: string[] = [];
     if (buf && buf.count > 1) {
       const t1 = buf.at(buf.count - 1).t;
-      const t0 = t1 - span;
+      let t0 = t1 - span;
       if (!logic) {
-        // trigger: find a rising crossing of CH1 near the left edge for a stable picture
+        // Auto trigger: latest rising edge of CH1 through the mid-level of the recent signal that
+        // still leaves a full screen of samples after it. Falls back to free-run when CH1 is flat.
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (let i = 0; i < buf.count; i++) {
+          const s = buf.at(i);
+          if (s.t < t0 - span) continue;
+          const v = s.v(0);
+          lo = Math.min(lo, v);
+          hi = Math.max(hi, v);
+        }
+        if (hi - lo > 1e-3) {
+          const level = (hi + lo) / 2;
+          let prevV = buf.at(0).v(0);
+          let trig = -Infinity;
+          for (let i = 1; i < buf.count; i++) {
+            const s = buf.at(i);
+            const v = s.v(0);
+            if (prevV < level && v >= level && s.t <= t1 - span) trig = s.t;
+            prevV = v;
+          }
+          if (trig > -Infinity) t0 = trig - span * 0.1;
+        }
         for (let ch = 0; ch < 2; ch++) {
           const vdiv = Number(comp.params[ch === 0 ? "vdiv1" : "vdiv2"]) || 1;
           ctx.strokeStyle = CH_COLORS[ch]!;
@@ -78,6 +99,7 @@ function ScopeScreen({ id, logic }: { id: string; logic: boolean }): React.JSX.E
           for (let i = 0; i < buf.count; i++) {
             const s = buf.at(i);
             if (s.t < t0) continue;
+            if (s.t > t0 + span) break;
             const v = s.v(ch);
             vmin = Math.min(vmin, v);
             vmax = Math.max(vmax, v);
@@ -105,6 +127,7 @@ function ScopeScreen({ id, logic }: { id: string; logic: boolean }): React.JSX.E
           for (let i = 0; i < buf.count; i++) {
             const s = buf.at(i);
             if (s.t < t0) continue;
+            if (s.t > t0 + span) break;
             const x = ((s.t - t0) / span) * W;
             const y = s.v(ch) > th ? base - H / 12 : base;
             if (!started) {
@@ -143,59 +166,44 @@ function ScopeScreen({ id, logic }: { id: string; logic: boolean }): React.JSX.E
   );
 }
 
-export function ScopePanel(): React.JSX.Element | null {
-  const open = useUiStore((s) => s.scopeOpen);
-  const setOpen = useUiStore((s) => s.setScopeOpen);
+export function InstrumentsView(): React.JSX.Element | null {
   const comps = useCircuitStore((s) => s.components);
   const update = useCircuitStore((s) => s.updateParams);
   const instruments = comps.filter((c) => c.kind === "scope" || c.kind === "logic_analyzer");
   const [sel, setSel] = useState<string | null>(null);
   const current = instruments.find((c) => c.id === sel) ?? instruments[0];
 
-  if (instruments.length === 0) return null;
+  if (!current) return <div className="p-3 font-mono text-[11px] text-ink-faint">No oscilloscope or logic analyzer in the circuit.</div>;
 
   return (
-    <div className="border-t border-bg-line bg-bg-panel">
-      <button
-        type="button"
-        onClick={() => setOpen(!open)}
-        className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-bg-raised"
-      >
-        {open ? <ChevronDown className="h-3.5 w-3.5 text-ink-dim" /> : <ChevronUp className="h-3.5 w-3.5 text-ink-dim" />}
-        <span className="panel-title !text-ink">Instruments</span>
-        <span className="font-mono text-[10px] text-ink-faint">{instruments.map((i) => i.label).join(" · ")}</span>
-      </button>
-      {open && current && (
-        <div className="flex h-[230px] gap-3 border-t border-bg-line p-2">
-          <ScopeScreen id={current.id} logic={current.kind === "logic_analyzer"} />
-          <div className="w-[200px] shrink-0 space-y-2 overflow-y-auto font-mono text-[10px] text-ink-dim">
-            {instruments.length > 1 && (
-              <select
-                value={current.id}
-                onChange={(e) => setSel(e.target.value)}
-                className="h-7 w-full border border-bg-line bg-bg px-1 text-[11px] text-ink"
-              >
-                {instruments.map((i) => (
-                  <option key={i.id} value={i.id}>{i.label}</option>
-                ))}
-              </select>
-            )}
-            {current.kind === "scope" ? (
-              <>
-                <SciField label="CH1 volts/div" value={Number(current.params.vdiv1)} unit="V" onCommit={(v) => update(current.id, { vdiv1: v })} />
-                <SciField label="CH2 volts/div" value={Number(current.params.vdiv2)} unit="V" onCommit={(v) => update(current.id, { vdiv2: v })} />
-                <SciField label="Time/div" value={Number(current.params.tdiv)} unit="s" onCommit={(v) => update(current.id, { tdiv: v })} />
-              </>
-            ) : (
-              <>
-                <SciField label="Threshold" value={Number(current.params.threshold)} unit="V" onCommit={(v) => update(current.id, { threshold: v })} />
-                <SciField label="Time/div" value={Number(current.params.tdiv)} unit="s" onCommit={(v) => update(current.id, { tdiv: v })} />
-              </>
-            )}
-            <div className="text-ink-faint">Type values like <span className="text-ink-dim">500m</span>, <span className="text-ink-dim">2u</span>, <span className="text-ink-dim">5k</span>.</div>
-          </div>
-        </div>
-      )}
+    <div className="flex h-full gap-3 p-2">
+      <ScopeScreen id={current.id} logic={current.kind === "logic_analyzer"} />
+      <div className="w-[200px] shrink-0 space-y-2 overflow-y-auto font-mono text-[10px] text-ink-dim">
+        {instruments.length > 1 && (
+          <select
+            value={current.id}
+            onChange={(e) => setSel(e.target.value)}
+            className="h-7 w-full border border-bg-line bg-bg px-1 text-[11px] text-ink"
+          >
+            {instruments.map((i) => (
+              <option key={i.id} value={i.id}>{i.label}</option>
+            ))}
+          </select>
+        )}
+        {current.kind === "scope" ? (
+          <>
+            <SciField label="CH1 volts/div" value={Number(current.params.vdiv1)} unit="V" onCommit={(v) => update(current.id, { vdiv1: v })} />
+            <SciField label="CH2 volts/div" value={Number(current.params.vdiv2)} unit="V" onCommit={(v) => update(current.id, { vdiv2: v })} />
+            <SciField label="Time/div" value={Number(current.params.tdiv)} unit="s" onCommit={(v) => update(current.id, { tdiv: v })} />
+          </>
+        ) : (
+          <>
+            <SciField label="Threshold" value={Number(current.params.threshold)} unit="V" onCommit={(v) => update(current.id, { threshold: v })} />
+            <SciField label="Time/div" value={Number(current.params.tdiv)} unit="s" onCommit={(v) => update(current.id, { tdiv: v })} />
+          </>
+        )}
+        <div className="text-ink-faint">Type values like <span className="text-ink-dim">500m</span>, <span className="text-ink-dim">2u</span>, <span className="text-ink-dim">5k</span>.</div>
+      </div>
     </div>
   );
 }
