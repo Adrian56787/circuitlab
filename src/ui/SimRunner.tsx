@@ -6,17 +6,23 @@ import { CATALOG } from "@/models/catalog";
 import { useCircuitStore } from "@/store/circuitStore";
 import { useSimStore } from "@/store/simulationStore";
 
-/** Pick a solver step that resolves the fastest source in the circuit (≥ 40 steps per cycle). */
-function autoDt(base: number): number {
+/**
+ * Solver step ceilings: `hard` keeps AC sources at ≥ 100 steps per cycle and gives every scope / logic analyser
+ * at least ~100 steps per division, so waveforms stay smooth and accurate however fast the clock runs.
+ */
+function stepLimits(base: number): { base: number; hard: number } {
   const { components } = useCircuitStore.getState();
-  let fmax = 0;
+  let hard = Infinity;
   for (const c of components) {
     if (c.kind === "vac" || c.kind === "sigen") {
       const f = Number(c.params.frequency);
-      if (Number.isFinite(f)) fmax = Math.max(fmax, f);
+      if (Number.isFinite(f) && f > 0) hard = Math.min(hard, 1 / (f * 100));
+    } else if (c.kind === "scope" || c.kind === "logic_analyzer") {
+      const t = Number(c.params.tdiv);
+      if (Number.isFinite(t) && t > 0) hard = Math.min(hard, t / 100);
     }
   }
-  return fmax > 0 ? Math.min(base, 1 / (fmax * 80)) : base;
+  return { base: Math.min(base, hard), hard };
 }
 
 /**
@@ -54,7 +60,8 @@ export function SimRunner(): null {
         ctl.bump();
       }
 
-      const dtBase = autoDt(ctl.baseDt);
+      const lim = stepLimits(ctl.baseDt);
+      const dtBase = lim.base;
       let changed = false;
 
       if (ctl.stepRequests !== handledStep) {
@@ -62,7 +69,7 @@ export function SimRunner(): null {
         for (let i = 0; i < 1; i++) sim.step(dtBase);
         changed = true;
       } else if (ctl.running && CATALOG && circuit.components.length > 0) {
-        sim.advance(frameSec * ctl.speed, dtBase, 400, 10);
+        sim.advance(frameSec * ctl.speed, dtBase, 1500, 10, lim.hard);
         changed = true;
       }
 

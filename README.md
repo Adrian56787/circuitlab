@@ -6,7 +6,7 @@ Interactive electronics simulator: Next.js 15 (App Router, strict TypeScript), T
 npm install
 npm run dev          # http://localhost:3000
 npm run typecheck
-npm run selftest     # ~140 checks (solver, devices, Arduino compiler, MCU-in-circuit, presets) of the solver, device models and presets
+npm run selftest     # ~170 checks (solver, AC, scope, generators, transformers, Arduino compiler, MCU-in-circuit, presets)
 npm run build
 ```
 
@@ -25,7 +25,7 @@ npm run build
 
 ## Engine
 
-* Modified Nodal Analysis, backward-Euler companion models for C and L, Newton–Raphson for
+* Modified Nodal Analysis, θ-method (θ = 0.55, near-trapezoidal) companion models for C and L, Newton–Raphson for
   nonlinear parts (SPICE `pnjlim` limiting on junctions, step limiting + gain homotopy on behavioural blocks).
 * Variable step: the runner shrinks the step for AC sources and stretches it at high speed.
 * Overload model: each part reports `stress` (fraction of its rating); sustained stress > 1 accumulates
@@ -37,10 +37,26 @@ npm run build
 
 Resistor, LDR, NTC/PTC, potentiometer/trimmer, capacitors, inductor, DC/AC/signal sources (bench supplies
 have a smooth constant-current limit), batteries, diodes (rectifier/Zener/Schottky/LED), RGB LED, 7-segment,
-BJT NPN/PNP, JFET, MOSFET N/P, SCR, triac, optocoupler, transformer (coupled windings), UA741/LM358,
+BJT NPN/PNP, JFET, MOSFET N/P, SCR, triac, optocoupler, transformer (coupled windings, optional centre tap, core loss), UA741/LM358,
 78xx/79xx/LM317, 7400-series gates, 555, relay, switches/DIP/push button, buzzer, DC motor, servo,
-HC-SR04, LCD 16×2 (HD44780 4/8-bit protocol decoder), multimeter, 2-channel scope (auto-trigger),
+HC-SR04, LCD 16×2 (HD44780 4/8-bit protocol decoder), multimeter (DC and true-RMS AC), 2-channel scope (see below),
 8-channel logic analyser, and **microcontrollers** (Arduino Uno, ESP32 DevKit, ATtiny85).
+
+## AC, generators and the oscilloscope
+
+* **AC source / function generator**: sine, square (duty), triangle, sawtooth; amplitude as peak, RMS or peak-to-peak;
+  phase, DC offset and output resistance. The step is capped so each period has at least 100 samples and source
+  corners are hit exactly, so waveforms are not rounded off.
+* **Transformer**: coupled windings solved as MNA branch currents (V = R·i + L·di/dt with mutual inductance),
+  centre-tap variant (two series-aiding half secondaries), core loss; the Inspector shows RMS voltages/currents,
+  power in/out and efficiency.
+* **Multimeter**: DC, true-RMS AC voltage and AC current.
+* **Oscilloscope** (dock + on-canvas symbol share one renderer): min/max envelope sampling (no aliasing at slow
+  time bases), Y-T and X-Y, triggering on CH1/CH2 (rising/falling, auto/normal, auto or manual level, hysteresis,
+  10 % pre-trigger), DC/AC/GND coupling, vertical position, 1-2-5 V/div and time/div ladders, CH1±CH2 / CH1×CH2 math,
+  Vpp/mean/RMS/frequency/period read-outs, hover cursors, STOP, AUTO set and PNG export.
+* **AC presets**: 230 V mains supply with regulator, centre-tap full-wave rectifier, step-down transformer with
+  AC voltmeter, series RLC resonance, RC phase shift in X-Y, voltage doubler, zener clipper.
 
 ## Microcontrollers
 
@@ -66,8 +82,3 @@ arrows nudge (Shift ×5) · `Ctrl+S` export JSON · the circuit is autosaved to 
 1. Obstacle-aware wire routing and wire waypoints.
 2. Wire/SPI/EEPROM libraries and structs/classes in the sketch compiler.
 3. Split `engine/devices.ts` further.
-
-
-## Actualización del source
-
-Repositorio actualizado con el source nuevo de CircuitLab: motor de simulación ampliado, dispositivos adicionales, MCU, editor de código, monitor serie y nuevos paneles de interfaz.

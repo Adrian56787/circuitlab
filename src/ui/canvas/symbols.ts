@@ -2,6 +2,8 @@ import { LED_VF } from "@/models/catalog";
 import { BAND_COLORS, resistanceToBands } from "@/models/resistorColor";
 import { formatEng } from "@/models/units";
 import { peekLcd } from "@/engine/lcdStore";
+import { cfgFromParams } from "@/engine/scopeMath";
+import { drawScope } from "@/ui/scope/renderScope";
 import { probes } from "@/engine/probes";
 import type { ComponentDef, ComponentSnapshot, PlacedComponent, Rotation } from "@/models/types";
 
@@ -179,6 +181,21 @@ const SCHEM: Record<string, Sym> = {
     line(c, 1.9, 0.3, 1.9, 3.7);
     line(c, 2.1, 0.3, 2.1, 3.7);
   },
+  transformer_ct(c) {
+    line(c, 0, 0, 1.2, 0, 1.2, 0.2);
+    line(c, 0, 4, 1.2, 4, 1.2, 3.8);
+    line(c, 4, 0, 2.8, 0, 2.8, 0.2);
+    line(c, 4, 4, 2.8, 4, 2.8, 3.8);
+    line(c, 4, 2, 2.8, 2);
+    c.beginPath();
+    for (let i = 0; i < 4; i++) c.arc(1.2, 0.5 + i * 0.75, 0.375, -Math.PI / 2, Math.PI / 2, false);
+    c.stroke();
+    c.beginPath();
+    for (let i = 0; i < 4; i++) c.arc(2.8, 0.5 + i * 0.75, 0.375, -Math.PI / 2, Math.PI / 2, true);
+    c.stroke();
+    line(c, 1.9, 0.3, 1.9, 3.7);
+    line(c, 2.1, 0.3, 2.1, 3.7);
+  },
   pot(c) {
     SCHEM.resistor!(c, null as never, null as never, null as never);
     line(c, 2, 2, 2, 0.55);
@@ -327,8 +344,8 @@ const SCHEM: Record<string, Sym> = {
       let y: number;
       if (wf === "sine") y = Math.sin(t * TAU);
       else if (wf === "triangle") y = 1 - 4 * Math.abs(((t * 1.5) % 1) - 0.5);
-      else if (wf === "pwm") y = ((t * 2) % 1) < 0.3 ? 1 : -1;
-      else y = ((t * 2) % 1) < 0.5 ? 1 : -1;
+      else if (wf === "sawtooth") y = -1 + 2 * ((t * 2) % 1);
+      else y = ((t * 2) % 1) < Math.min(0.95, Math.max(0.05, Number(p.params.duty ?? 50) / 100)) ? 1 : -1;
       const yy = 2 - 0.35 * y;
       if (i === 0) c.moveTo(x, yy);
       else c.lineTo(x, yy);
@@ -610,16 +627,16 @@ function dmmFace(c: C, p: PlacedComponent, o: DrawOpts, x0: number, y0: number, 
   let s = "----";
   if (r !== undefined) {
     if (overload) s = "OL";
-    else if (mode === "voltage") s = formatEng(r, "volt", 4);
-    else if (mode === "current") s = formatEng(r, "amp", 4);
+    else if (mode.startsWith("voltage")) s = formatEng(r, "volt", 4);
+    else if (mode.startsWith("current")) s = formatEng(r, "amp", 4);
     else s = formatEng(r, "ohm", 4);
   }
   text(c, s, (x0 + x1) / 2, y0 + 1.7, 15, "center", "#5dff9a");
-  text(c, mode === "voltage" ? "V DC" : mode === "current" ? "A DC" : "Ω", x1 - 0.8, y0 + 0.95, 8, "right", "#5dff9a");
+  text(c, mode === "voltage" ? "V DC" : mode === "voltage_ac" ? "V AC" : mode === "current" ? "A DC" : mode === "current_ac" ? "A AC" : "Ω", x1 - 0.8, y0 + 0.95, 8, "right", "#5dff9a");
   c.beginPath();
   c.arc((x0 + x1) / 2, y0 + 5.2, 1.3, 0, TAU);
   c.stroke();
-  const a = mode === "voltage" ? -0.6 : mode === "current" ? 0.6 : 1.9;
+  const a = mode === "voltage" ? -0.6 : mode === "voltage_ac" ? -1.2 : mode === "current" ? 0.6 : mode === "current_ac" ? 1.2 : 1.9;
   line(c, (x0 + x1) / 2, y0 + 5.2, (x0 + x1) / 2 + Math.sin(a) * 1.1, y0 + 5.2 - Math.cos(a) * 1.1);
 }
 
@@ -631,49 +648,10 @@ function scopeFace(c: C, p: PlacedComponent, o: DrawOpts, x0: number, y0: number
   drawScopeScreen(c, p, sx, sy, sw, sh, o);
 }
 
-/** Shared by the on-canvas scope and (via transform) any other consumer. */
+/** The on-canvas scope screen: same renderer as the Instruments dock, without the legend. */
 export function drawScopeScreen(c: C, p: PlacedComponent, sx: number, sy: number, sw: number, sh: number, o: Pick<DrawOpts, "accent">): void {
-  c.save();
-  c.fillStyle = "#06120c";
-  c.fillRect(sx, sy, sw, sh);
-  c.lineWidth = 0.03;
-  c.strokeStyle = "rgba(57,255,136,0.22)";
-  for (let i = 0; i <= 10; i++) line(c, sx + (sw * i) / 10, sy, sx + (sw * i) / 10, sy + sh);
-  for (let j = 0; j <= 8; j++) line(c, sx, sy + (sh * j) / 8, sx + sw, sy + (sh * j) / 8);
-  c.strokeStyle = "rgba(57,255,136,0.5)";
-  line(c, sx, sy + sh / 2, sx + sw, sy + sh / 2);
-  line(c, sx + sw / 2, sy, sx + sw / 2, sy + sh);
-  const buf = probes().get(p.id);
-  if (buf && buf.count > 1) {
-    const tdiv = num(p, "tdiv", 1e-3);
-    const span = tdiv * 10;
-    const t1 = buf.at(buf.count - 1).t;
-    const t0 = t1 - span;
-    const cols = ["#ffe62a", "#2fd8ff"];
-    for (let ch = 0; ch < 2; ch++) {
-      const vdiv = num(p, ch === 0 ? "vdiv1" : "vdiv2", 1);
-      c.strokeStyle = cols[ch]!;
-      c.lineWidth = 0.06;
-      c.beginPath();
-      let started = false;
-      for (let i = 0; i < buf.count; i++) {
-        const s = buf.at(i);
-        if (s.t < t0) continue;
-        const x = sx + ((s.t - t0) / span) * sw;
-        const y = sy + sh / 2 - (s.v(ch) / vdiv) * (sh / 8);
-        const yc = Math.max(sy, Math.min(sy + sh, y));
-        if (!started) {
-          c.moveTo(x, yc);
-          started = true;
-        } else c.lineTo(x, yc);
-      }
-      c.stroke();
-    }
-  }
-  c.strokeStyle = o.accent;
-  c.lineWidth = LW;
-  c.strokeRect(sx, sy, sw, sh);
-  c.restore();
+  const cfg = cfgFromParams(p.params);
+  drawScope(c, sx, sy, sw, sh, cfg, probes().get(p.id), { unit: sw / 190, labels: false, hover: null, frozen: null, accent: o.accent });
 }
 
 function logicFace(c: C, p: PlacedComponent, o: DrawOpts, x0: number, y0: number, x1: number, y1: number): void {
@@ -900,6 +878,16 @@ const PHYS: Record<string, Phys> = {
     c.fillRect(1.1, 0.8, 0.9, 2.4);
     c.fillRect(2, 0.8, 0.9, 2.4);
     for (const [x, y] of [[0, 0], [0, 4], [4, 0], [4, 4]] as const) metalLead(c, x, y, x < 2 ? 0.6 : 3.4, y < 2 ? 0.2 : 3.8);
+  },
+  transformer_ct(c) {
+    c.fillStyle = "#2b2f36";
+    c.fillRect(0.6, 0.2, 2.8, 3.6);
+    c.fillStyle = "#3a4048";
+    c.fillRect(0.9, 0.5, 2.2, 3);
+    c.fillStyle = "#b9722e";
+    c.fillRect(1.1, 0.8, 0.9, 2.4);
+    c.fillRect(2, 0.8, 0.9, 2.4);
+    for (const [x, y] of [[0, 0], [0, 4], [4, 0], [4, 2], [4, 4]] as const) metalLead(c, x, y, x < 2 ? 0.6 : 3.4, y < 2 ? 0.2 : y > 2 ? 3.8 : 2);
   },
   pot(c, p) {
     metalLead(c, 0, 0, 0.8, 0);

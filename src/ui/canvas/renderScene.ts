@@ -119,6 +119,8 @@ export function classifyWires(
   return out;
 }
 
+const ampSuffix = (p: PlacedComponent["params"]): string => (p.ampType === "rms" ? " rms" : p.ampType === "pp" ? " pp" : " pk");
+
 export function valueText(c: PlacedComponent): string {
   const p = c.params;
   const n = (k: string): number => (typeof p[k] === "number" ? (p[k] as number) : 0);
@@ -139,9 +141,9 @@ export function valueText(c: PlacedComponent): string {
     case "battery_lipo":
       return formatEng(n("voltage"), "volt");
     case "vac":
-      return `${formatEng(n("amplitude"), "volt")} ${formatEng(n("frequency"), "hertz")}`;
+      return `${formatEng(n("amplitude"), "volt")}${ampSuffix(p)} ${formatEng(n("frequency"), "hertz")}`;
     case "sigen":
-      return `${String(p.waveform)} ${formatEng(n("frequency"), "hertz")}`;
+      return `${String(p.waveform === "pwm" ? "square" : p.waveform)} ${formatEng(n("amplitude"), "volt")}${ampSuffix(p)} ${formatEng(n("frequency"), "hertz")}`;
     case "zener":
       return formatEng(n("vz"), "volt");
     case "led":

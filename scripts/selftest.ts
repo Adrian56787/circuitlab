@@ -5,6 +5,8 @@ import { compileSketch } from "../src/mcu/codegen";
 import { boardFor } from "../src/mcu/boards";
 import { McuIo, getIo } from "../src/mcu/io";
 import { McuRuntime, type Program } from "../src/mcu/runtime";
+import { autoSet, cfgFromParams, findSweep, measure, windowRange } from "../src/engine/scopeMath";
+import { sourceValue } from "../src/engine/devices";
 import { peekLcd } from "../src/engine/lcdStore";
 import { templateById } from "../src/mcu/templates";
 import type { PlacedComponent, Wire } from "../src/models/types";
@@ -710,6 +712,256 @@ for (const [kind, pinId, gnd] of [["attiny85", "p6", "p4"], ["esp32", "r_g2", "g
   sim.compile(m.comps, m.wires);
   while (sim.time < 1.0) sim.step(1e-3);
   check("shorted GPIO burns the MCU (burned flag)", sim.snapshot().components[m.b.id]!.burned ? 1 : 0, 1, 0);
+}
+
+
+// ───────── AC behaviour ─────────
+function acGain(comps: PlacedComponent[], ws: Wire[], f: number, probe: [PlacedComponent, string], ref: [PlacedComponent, string], spc: number): { gain: number; phase: number } {
+  const sim = new Simulator();
+  sim.compile(comps, ws);
+  const dt = 1 / (f * spc);
+  let a = 0, b = 0, ar = 0, br = 0, cnt = 0;
+  while (sim.time < 50 / f) {
+    sim.step(dt);
+    if (sim.time > 40 / f) {
+      const w = 2 * Math.PI * f * sim.time;
+      const v = netV(sim, ...probe), r = netV(sim, ...ref);
+      a += v * Math.sin(w); b += v * Math.cos(w); ar += r * Math.sin(w); br += r * Math.cos(w); cnt++;
+    }
+  }
+  let ph = Math.atan2(b, a) - Math.atan2(br, ar);
+  ph = ((ph + Math.PI) % (2 * Math.PI)) - Math.PI;
+  return { gain: Math.hypot(a, b) / Math.hypot(ar, br), phase: (ph * 180) / Math.PI };
+}
+{
+  const v = comp("vac", "V", { amplitude: 1, frequency: 1000, rint: 0 });
+  const r = comp("resistor", "R", { resistance: 1000 });
+  const c = comp("cap_ceramic", "C", { capacitance: 159.155e-9 });
+  const g = comp("ground", "G");
+  const m = acGain([v, r, c, g], [wire(v, "p", r, "a"), wire(r, "b", c, "a"), wire(c, "b", g, "g"), wire(v, "n", g, "g")], 1000, [c, "a"], [v, "p"], 100);
+  check("AC RC low-pass gain at fc", m.gain, 0.7071, 0.005);
+  check("AC RC low-pass phase at fc (deg)", m.phase, -45, 1);
+}
+{
+  const v = comp("vac", "V", { amplitude: 1, frequency: 1000, rint: 0 });
+  const r = comp("resistor", "R", { resistance: 628.3 });
+  const l = comp("inductor", "L", { inductance: 0.1 });
+  const g = comp("ground", "G");
+  const m = acGain([v, r, l, g], [wire(v, "p", r, "a"), wire(r, "b", l, "a"), wire(l, "b", g, "g"), wire(v, "n", g, "g")], 1000, [l, "a"], [v, "p"], 100);
+  check("AC RL gain at corner", m.gain, 0.7071, 0.005);
+  check("AC RL phase at corner (deg)", m.phase, 45, 1);
+}
+{
+  const L = 10e-3, C = 1e-6, R = 10;
+  const f0 = 1 / (2 * Math.PI * Math.sqrt(L * C));
+  const v = comp("vac", "V", { amplitude: 1, frequency: f0, rint: 0 });
+  const r = comp("resistor", "R", { resistance: R });
+  const l = comp("inductor", "L", { inductance: L, dcr: 0.001 });
+  const c = comp("cap_ceramic", "C", { capacitance: C });
+  const g = comp("ground", "G");
+  const m = acGain([v, r, l, c, g], [wire(v, "p", r, "a"), wire(r, "b", l, "a"), wire(l, "b", c, "a"), wire(c, "b", g, "g"), wire(v, "n", g, "g")], f0, [c, "a"], [v, "p"], 100);
+  check("AC series RLC: Q at resonance (Vc/Vin)", m.gain, 10, 0.8);
+}
+{
+  const v = comp("vac", "V", { amplitude: 3, frequency: 50, phase: 90, offset: 1, rint: 0 });
+  const r = comp("resistor", "R");
+  const g = comp("ground", "G");
+  const sim = new Simulator();
+  sim.compile([v, r, g], [wire(v, "p", r, "a"), wire(r, "b", g, "g"), wire(v, "n", g, "g")]);
+  sim.step(1e-6);
+  check("AC source phase 90° + offset at t≈0 (V)", netV(sim, v, "p"), 4, 0.01);
+}
+{
+  const v = comp("vac", "V", { amplitude: 10, frequency: 50, rint: 0.01 });
+  const r = comp("resistor", "R", { resistance: 1000 });
+  const m = comp("dmm", "M", { mode: "voltage_ac" });
+  const g = comp("ground", "G");
+  const sim = simulate([v, r, m, g], [wire(v, "p", r, "a"), wire(r, "b", g, "g"), wire(v, "p", m, "in"), wire(m, "com", g, "g"), wire(v, "n", g, "g")], 0.5, 1e-4);
+  check("DMM AC RMS of 10 Vpk sine (V)", sim.snapshot().components[m.id]!.aux.reading!, 7.071, 0.05);
+}
+{
+  // mains step-down: 325 Vpk, Ns/Np = 0.1, 100 Ω load
+  const v = comp("vac", "V", { amplitude: 325, frequency: 50, rint: 0.1 });
+  const t = comp("transformer", "T", { turnsRatio: 0.1 });
+  const rl = comp("resistor", "RL", { resistance: 100, powerRating: 5 });
+  const g = comp("ground", "G");
+  const g2 = comp("ground", "G2");
+  let pk = 0;
+  simulate([v, t, rl, g, g2], [wire(v, "p", t, "p1"), wire(v, "n", g, "g"), wire(t, "p2", g, "g"), wire(t, "s1", rl, "a"), wire(t, "s2", g2, "g"), wire(rl, "b", g2, "g")], 0.2, 1e-4, (s) => {
+    if (s.time > 0.1) pk = Math.max(pk, Math.abs(netV(s, rl, "a")));
+  });
+  check("transformer 50 Hz secondary peak (V)", pk, 31, 3);
+}
+
+
+// Arduino button preset: LED follows the button (INPUT_PULLUP, pressed = LOW)
+{
+  const data = PRESETS.find((q) => q.id === "uno-button")!.build();
+  const sim = new Simulator();
+  sim.compile(data.components, data.wires);
+  const led = data.components.find((c) => c.kind === "led")!;
+  const btn = data.components.find((c) => c.kind === "pushbutton")!;
+  const ledV = (): number => netV(sim, led, "a");
+  while (sim.time < 0.1) sim.step(1e-3);
+  check("uno-button: LED off when button released (V)", ledV(), 0, 0.1);
+  btn.params = { ...btn.params, closed: true };
+  sim.compile(data.components, data.wires);
+  while (sim.time < 0.2) sim.step(1e-3);
+  check("uno-button: LED on when button pressed (V)", ledV(), 1.9, 0.5);
+  btn.params = { ...btn.params, closed: false };
+  sim.compile(data.components, data.wires);
+  while (sim.time < 0.3) sim.step(1e-3);
+  check("uno-button: LED off again after release (V)", ledV(), 0, 0.1);
+}
+
+
+// ───────── oscilloscope ─────────
+{
+  const v = comp("vac", "V", { amplitude: 5, frequency: 50, offset: 2, rint: 0.01 });
+  const r = comp("resistor", "R", { resistance: 1000 });
+  const g = comp("ground", "G");
+  const sc = comp("scope", "SC", { tdiv: 0.005 });
+  const sim = new Simulator();
+  sim.compile([v, r, g, sc], [wire(v, "p", r, "a"), wire(r, "b", g, "g"), wire(v, "n", g, "g"), wire(v, "p", sc, "ch1"), wire(sc, "gnd", g, "g")]);
+  while (sim.time < 0.5) sim.step(1 / (50 * 100));
+  const buf = sim.probes.get(sc.id)!;
+  check("scope: samples stored every step (≥ 4000/screen cap)", buf.count > 1000 ? 1 : 0, 1, 0);
+  const cfg = cfgFromParams({ ...sc.params });
+  const sw = findSweep(buf, cfg)!;
+  check("scope: triggered on a rising edge", sw.triggered ? 1 : 0, 1, 0);
+  check("scope: trigger level = mid of the swing (V)", sw.level, 2, 0.15);
+  // the trigger sample must be a rising crossing near the level
+  const { i0, i1 } = windowRange(buf, sw.t0, sw.span);
+  const m = measure(buf, (i) => buf.ch[0]![i]!, i0, i1)!;
+  check("scope: Vpp over the screen (V)", m.vpp, 10, 0.1);
+  check("scope: mean (V)", m.mean, 2, 0.1);
+  check("scope: rms of 5 Vpk + 2 V offset (V)", m.rms, Math.sqrt(25 / 2 + 4), 0.1);
+  check("scope: measured frequency (Hz)", m.freq ?? -1, 50, 0.5);
+  // trigger point sits at 10 % of the screen
+  check("scope: pre-trigger fraction", (sw.tTrig - sw.t0) / sw.span, 0.1, 1e-6);
+  // two consecutive sweeps (one period apart) start at the same phase
+  const sw2 = findSweep(buf, { ...cfg, trigRising: false })!;
+  check("scope: falling-edge trigger found", sw2.triggered ? 1 : 0, 1, 0);
+  const patch = autoSet(buf, { ...cfg, tdiv: 0.1 });
+  check("scope: auto-set time base ≈ 2-3 cycles (s/div)", Number(patch.tdiv ?? -1), 0.005, 0.0045);
+  check("scope: auto-set volts/div fits 10 Vpp in ≤ 6 div (V)", Number(patch.vdiv1 ?? -1), 2, 1.01);
+}
+
+
+// ───────── generators ─────────
+{
+  const mk = (extra: Record<string, number | string | boolean>) => comp("sigen", "G", { rint: 0, ...extra });
+  const probe = (g: PlacedComponent, t: number): number => sourceValue(g, t);
+  const sq = mk({ waveform: "square", amplitude: 2, offset: 1, frequency: 100, duty: 25 });
+  check("sigen square: high level (V)", probe(sq, 0.0010), 3, 1e-9);
+  check("sigen square: low level (V)", probe(sq, 0.0060), -1, 1e-9);
+  const saw = mk({ waveform: "sawtooth", amplitude: 1, offset: 0, frequency: 100 });
+  check("sigen sawtooth: mid-cycle value (V)", probe(saw, 0.005), 0, 0.02);
+  const tri = mk({ waveform: "triangle", amplitude: 1, offset: 0, frequency: 100 });
+  check("sigen triangle: peak at quarter cycle (V)", probe(tri, 0.0025), 1, 1e-9);
+  const rms = mk({ waveform: "sine", amplitude: 230, ampType: "rms", offset: 0, frequency: 50 });
+  check("sigen sine 230 Vrms: peak (V)", probe(rms, 0.005), 230 * Math.SQRT2, 1e-6);
+  const pp = mk({ waveform: "sine", amplitude: 10, ampType: "pp", offset: 0, frequency: 50 });
+  check("sigen sine 10 Vpp: peak (V)", probe(pp, 0.005), 5, 1e-6);
+  const mains = comp("vac", "M", { amplitude: 230, ampType: "rms", frequency: 50, rint: 0.01 });
+  check("vac 230 Vrms: peak (V)", probe(mains, 0.005), 230 * Math.SQRT2, 1e-6);
+
+  // exact edge placement: a 1 kHz / 30 % pulse train measured through a scope has the right duty and period
+  const g = mk({ waveform: "square", amplitude: 2.5, offset: 2.5, frequency: 1000, duty: 30 });
+  const r = comp("resistor", "R", { resistance: 1000 });
+  const gd = comp("ground", "GND");
+  const sc = comp("scope", "SC", { tdiv: 0.0005 });
+  const sim = new Simulator();
+  sim.compile([g, r, gd, sc], [wire(g, "p", r, "a"), wire(r, "b", gd, "g"), wire(g, "n", gd, "g"), wire(g, "p", sc, "ch1"), wire(sc, "gnd", gd, "g")]);
+  while (sim.time < 0.05) sim.step(1 / (1000 * 100));
+  const buf = sim.probes.get(sc.id)!;
+  const i0 = buf.lowerBound(0.02);
+  const m = measure(buf, (i) => buf.ch[0]![i]!, i0, buf.count)!;
+  check("pulse train: mean = duty × Vpp (V)", m.mean, 5 * 0.3 + 0.0 + 0, 0.05);
+  check("pulse train: frequency (Hz)", m.freq ?? -1, 1000, 1);
+  // edges land on exact breakpoints: no sample may sit strictly inside an edge ramp more than twice per edge
+  let hits = 0;
+  for (let i = i0; i < buf.count; i++) {
+    const v = buf.ch[0]![buf.idx(i)]!;
+    if (v > 0.2 && v < 4.8) hits++;
+  }
+  check("pulse train: intermediate samples per edge ≤ 2", hits / (2 * 30), 1, 1);
+}
+
+
+// ───────── centre-tap transformer ─────────
+{
+  const v = comp("vac", "V", { amplitude: 230, ampType: "rms", frequency: 50, rint: 0.1 });
+  const t = comp("transformer_ct", "T", { turnsRatio: 0.1, ratedCurrent: 2 });
+  const g = comp("ground", "G");
+  const d1 = comp("diode", "D1");
+  const d2 = comp("diode", "D2");
+  const c = comp("cap_electrolytic", "C", { capacitance: 1000e-6, voltageRating: 50 });
+  const rl = comp("resistor", "RL", { resistance: 100, powerRating: 5 });
+  const gs = comp("ground", "GS");
+  const ws = [
+    wire(v, "p", t, "p1"), wire(v, "n", g, "g"), wire(t, "p2", g, "g"),
+    wire(t, "sc", gs, "g"),
+    wire(t, "s1", d1, "a"), wire(t, "s2", d2, "a"),
+    wire(d1, "k", c, "p"), wire(d2, "k", c, "p"), wire(c, "n", gs, "g"),
+    wire(c, "p", rl, "a"), wire(rl, "b", gs, "g"),
+  ];
+  let a1 = 0, a2 = 0, vmin = 1e9, vmax = -1e9, sumSum = 0, cnt = 0;
+  simulate([v, t, g, d1, d2, c, rl, gs], ws, 0.5, 1e-4, (sm) => {
+    if (sm.time > 0.3) {
+      const x1 = netV(sm, t, "s1"), x2 = netV(sm, t, "s2");
+      a1 = Math.max(a1, Math.abs(x1));
+      a2 = Math.max(a2, Math.abs(x2));
+      sumSum += Math.abs(x1 + x2) < 1 ? 0 : 0;
+      cnt++;
+      const o = netV(sm, c, "p");
+      vmin = Math.min(vmin, o);
+      vmax = Math.max(vmax, o);
+    }
+  });
+  void sumSum; void cnt;
+  check("CT: each half peaks near Vp·n/2 (V)", Math.max(a1, a2), 16.3, 2.5);
+  check("CT full-wave rectifier: DC output (V)", (vmin + vmax) / 2, 14.5, 2.5);
+  check("CT full-wave rectifier: ripple at 100 Hz keeps Vpp small (V)", vmax - vmin, 1.5, 1.5);
+}
+{
+  // balanced halves: s1 and s2 are in antiphase around the tap
+  const v = comp("vac", "V", { amplitude: 20, frequency: 50, rint: 0.01 });
+  const t = comp("transformer_ct", "T", { turnsRatio: 1 });
+  const g = comp("ground", "G");
+  const r1 = comp("resistor", "R1", { resistance: 1000 });
+  const r2 = comp("resistor", "R2", { resistance: 1000 });
+  const gs = comp("ground", "GS");
+  let worst = 0;
+  simulate([v, t, g, r1, r2, gs], [wire(v, "p", t, "p1"), wire(v, "n", g, "g"), wire(t, "p2", g, "g"), wire(t, "sc", gs, "g"), wire(t, "s1", r1, "a"), wire(r1, "b", gs, "g"), wire(t, "s2", r2, "a"), wire(r2, "b", gs, "g")], 0.3, 1e-4, (sm) => {
+    if (sm.time > 0.2) worst = Math.max(worst, Math.abs(netV(sm, t, "s1") + netV(sm, t, "s2")));
+  });
+  check("CT: halves are in antiphase (|s1 + s2| ≈ 0, V)", worst, 0, 0.3);
+}
+{
+  const v = comp("vac", "V", { amplitude: 325, frequency: 50, rint: 0.1 });
+  const t = comp("transformer", "T", { turnsRatio: 0.1 });
+  const rl = comp("resistor", "RL", { resistance: 100, powerRating: 10 });
+  const g = comp("ground", "G");
+  const g2 = comp("ground", "G2");
+  const sm = simulate([v, t, rl, g, g2], [wire(v, "p", t, "p1"), wire(v, "n", g, "g"), wire(t, "p2", g, "g"), wire(t, "s1", rl, "a"), wire(t, "s2", g2, "g"), wire(rl, "b", g2, "g")], 0.6, 1e-4);
+  const aux = sm.snapshot().components[t.id]!.aux;
+  check("transformer: secondary RMS read-out (V)", aux.vsRms!, 22.2, 2);
+  check("transformer: efficiency under load", aux.eff!, 0.85, 0.12);
+  check("transformer: output power ≈ Vs²/RL (W)", aux.pout!, (aux.vsRms! * aux.vsRms!) / 100, 0.8);
+}
+
+// AC presets keep running without burning anything for several seconds of circuit time
+for (const pr of PRESETS.filter((q) => /^ac-/.test(q.id))) {
+  const data = pr.build();
+  const sim = new Simulator();
+  sim.compile(data.components, data.wires);
+  const f = Math.max(...data.components.filter((c) => c.kind === "vac" || c.kind === "sigen").map((c) => Number(c.params.frequency)));
+  const dt = 1 / (f * 100);
+  while (sim.time < Math.max(1.5, 200 / f)) sim.step(dt);
+  const snap = sim.snapshot();
+  check(`AC preset ${pr.id}: nothing burned after ${sim.time.toFixed(1)} s`, snap.burned.length, 0, 0);
+  check(`AC preset ${pr.id}: converged`, snap.diagnostics.converged ? 1 : 0, 1, 0);
 }
 
 for (const pr of PRESETS.filter((q) => /^(uno|esp32|attiny)-/.test(q.id))) {

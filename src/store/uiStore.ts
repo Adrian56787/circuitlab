@@ -57,7 +57,7 @@ export const useUiStore = create<UiState>((set) => ({
   inspectorOpen: true,
   scopeOpen: false,
   dockTab: "instruments",
-  dockHeight: 280,
+  dockHeight: 340,
   mcuId: null,
   colorCalcOpen: false,
   toast: null,

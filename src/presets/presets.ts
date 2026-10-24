@@ -152,7 +152,7 @@ function bridgeRectifier(): CircuitData {
   const g1 = b.add("ground", 18, 9);
   const g2 = b.add("ground", 22, 9);
   const g3 = b.add("ground", 5, 12);
-  const sc = b.add("scope", 26, 0, { vdiv1: 5, vdiv2: 5, tdiv: 0.005 });
+  const sc = b.add("scope", 26, 0, { vdiv1: 5, vdiv2: 5, tdiv: 0.005, trigSrc: "ch2" });
   const g4 = b.add("ground", 24, 11);
   b.wire(v, "p", d1, "a");
   b.wire(v, "p", d3, "k");
@@ -219,9 +219,211 @@ function bjtAmplifier(): CircuitData {
 
 const tpl = (id: string): string => templateById(id)?.code ?? "";
 const TEMPLATE_POT = tpl("pot");
+const TEMPLATE_BUTTON = tpl("button");
 const TEMPLATE_SERVO = tpl("servo");
 const TEMPLATE_SONAR = tpl("sonar");
 const TEMPLATE_LCD = tpl("lcd");
+
+// ───────────────────────── AC presets ─────────────────────────
+
+/** Four-diode bridge: AC inputs a1/a2 → (pos, gnd). Returns the + rail diode cathodes. */
+function bridge(b: Builder, x: number, y: number, ac1: [string, string], ac2: [string, string], gnd: string): { pos: string } {
+  const d1 = b.add("diode", x, y);
+  const d2 = b.add("diode", x, y + 4);
+  const d3 = b.add("diode", x, y + 8);
+  const d4 = b.add("diode", x, y + 12);
+  b.wire(ac1[0], ac1[1], d1, "a");
+  b.wire(ac1[0], ac1[1], d3, "k");
+  b.wire(ac2[0], ac2[1], d2, "a");
+  b.wire(ac2[0], ac2[1], d4, "k");
+  b.wire(d1, "k", d2, "k");
+  b.wire(d3, "a", d4, "a");
+  b.wire(d3, "a", gnd, "g");
+  return { pos: d1 };
+}
+
+function mainsSupply(): CircuitData {
+  const b = new Builder();
+  const v = b.add("vac", 2, 2, { amplitude: 230, ampType: "rms", frequency: 50, rint: 0.5 }, 0, "MAINS");
+  const gv = b.add("ground", 2, 9);
+  b.wire(v, "n", gv, "g");
+  const t = b.add("transformer", 6, 2, { turnsRatio: 0.055, primaryInductance: 30, primaryResistance: 100, ratedCurrent: 0.1, coreLoss: 0.5 });
+  b.wire(v, "p", t, "p1");
+  const gt = b.add("ground", 6, 9);
+  b.wire(t, "p2", gt, "g");
+  const gn = b.add("ground", 12, 17);
+  const br = bridge(b, 14, 2, [t, "s1"], [t, "s2"], gn);
+  const c1 = b.add("cap_electrolytic", 22, 2, { capacitance: 1000e-6, voltageRating: 25 }, 90);
+  const g1 = b.add("ground", 22, 9);
+  b.wire(br.pos, "k", c1, "p");
+  b.wire(c1, "n", g1, "g");
+  const reg = b.add("reg7805", 26, 1);
+  const gr = b.add("ground", 29, 8);
+  b.wire(c1, "p", reg, "in");
+  b.wire(reg, "gnd", gr, "g");
+  const c2 = b.add("cap_electrolytic", 36, 2, { capacitance: 100e-6, voltageRating: 16 }, 90);
+  const g2 = b.add("ground", 36, 9);
+  b.wire(reg, "out", c2, "p");
+  b.wire(c2, "n", g2, "g");
+  const rl = b.add("resistor", 40, 2, { resistance: 220 }, 90);
+  const g3 = b.add("ground", 40, 9);
+  b.wire(reg, "out", rl, "a");
+  b.wire(rl, "b", g3, "g");
+  const sc = b.add("scope", 26, 11, { vdiv1: 0.5, vdiv2: 1, tdiv: 0.005, cpl1: "ac", trigSrc: "ch1" });
+  const gs = b.add("ground", 24, 20);
+  b.wire(sc, "ch1", c1, "p");
+  b.wire(sc, "ch2", reg, "out");
+  b.wire(sc, "gnd", gs, "g");
+  return b.build("230 V mains → transformer → bridge → filter → 7805");
+}
+
+function centreTapRectifier(): CircuitData {
+  const b = new Builder();
+  const v = b.add("vac", 2, 2, { amplitude: 230, ampType: "rms", frequency: 50, rint: 0.5 }, 0, "MAINS");
+  const gv = b.add("ground", 2, 9);
+  b.wire(v, "n", gv, "g");
+  const t = b.add("transformer_ct", 6, 2, { turnsRatio: 0.1, primaryInductance: 30, primaryResistance: 100, ratedCurrent: 0.2, coreLoss: 0.5 });
+  b.wire(v, "p", t, "p1");
+  const gt = b.add("ground", 6, 9);
+  b.wire(t, "p2", gt, "g");
+  const gc = b.add("ground", 11, 9);
+  b.wire(t, "sc", gc, "g");
+  const d1 = b.add("diode", 14, 2);
+  const d2 = b.add("diode", 14, 6);
+  b.wire(t, "s1", d1, "a");
+  b.wire(t, "s2", d2, "a");
+  b.wire(d1, "k", d2, "k");
+  const c1 = b.add("cap_electrolytic", 22, 2, { capacitance: 470e-6, voltageRating: 25 }, 90);
+  const rl = b.add("resistor", 26, 2, { resistance: 220, powerRating: 2 }, 90);
+  const g1 = b.add("ground", 22, 9);
+  const g2 = b.add("ground", 26, 9);
+  b.wire(d1, "k", c1, "p");
+  b.wire(c1, "p", rl, "a");
+  b.wire(c1, "n", g1, "g");
+  b.wire(rl, "b", g2, "g");
+  const sc = b.add("scope", 30, 0, { vdiv1: 5, vdiv2: 5, tdiv: 0.005, trigSrc: "ch2" });
+  const gs = b.add("ground", 28, 11);
+  b.wire(sc, "ch1", c1, "p");
+  b.wire(sc, "ch2", t, "s1");
+  b.wire(sc, "gnd", gs, "g");
+  return b.build("Centre-tap full-wave rectifier (12-0-12 V)");
+}
+
+function transformerScope(): CircuitData {
+  const b = new Builder();
+  const v = b.add("vac", 2, 2, { amplitude: 230, ampType: "rms", frequency: 50, rint: 0.5 }, 0, "MAINS");
+  const gv = b.add("ground", 2, 9);
+  b.wire(v, "n", gv, "g");
+  const t = b.add("transformer", 8, 2, { turnsRatio: 0.1, primaryInductance: 30, primaryResistance: 100, ratedCurrent: 0.2, coreLoss: 0.5 });
+  b.wire(v, "p", t, "p1");
+  const gt = b.add("ground", 8, 9);
+  b.wire(t, "p2", gt, "g");
+  const rl = b.add("resistor", 16, 2, { resistance: 220, powerRating: 5 }, 90);
+  const gl = b.add("ground", 16, 9);
+  const gs2 = b.add("ground", 12, 9);
+  b.wire(t, "s1", rl, "a");
+  b.wire(rl, "b", gl, "g");
+  b.wire(t, "s2", gs2, "g");
+  const m = b.add("dmm", 20, 1, { mode: "voltage_ac" });
+  const gm = b.add("ground", 18, 9);
+  b.wire(m, "in", rl, "a");
+  b.wire(m, "com", gm, "g");
+  const sc = b.add("scope", 20, 11, { vdiv1: 100, vdiv2: 5, tdiv: 0.005, trigSrc: "ch1" });
+  const gx = b.add("ground", 18, 20);
+  b.wire(sc, "ch1", v, "p");
+  b.wire(sc, "ch2", t, "s1");
+  b.wire(sc, "gnd", gx, "g");
+  return b.build("Step-down transformer: primary vs secondary");
+}
+
+function rlcResonance(): CircuitData {
+  const f0 = 1 / (2 * Math.PI * Math.sqrt(10e-3 * 1e-6));
+  const b = new Builder();
+  const v = b.add("vac", 2, 2, { amplitude: 1, frequency: Math.round(f0), rint: 0 }, 0, "V1");
+  const g1 = b.add("ground", 2, 9);
+  b.wire(v, "n", g1, "g");
+  const r = b.add("resistor", 6, 2, { resistance: 10 });
+  const l = b.add("inductor", 12, 2, { inductance: 10e-3, dcr: 0.1 });
+  const c = b.add("cap_ceramic", 18, 2, { capacitance: 1e-6 }, 90);
+  const g2 = b.add("ground", 18, 9);
+  b.wire(v, "p", r, "a");
+  b.wire(r, "b", l, "a");
+  b.wire(l, "b", c, "a");
+  b.wire(c, "b", g2, "g");
+  const sc = b.add("scope", 24, 0, { vdiv1: 1, vdiv2: 5, tdiv: 0.0002, trigSrc: "ch1" });
+  const gs = b.add("ground", 22, 11);
+  b.wire(sc, "ch1", v, "p");
+  b.wire(sc, "ch2", l, "b");
+  b.wire(sc, "gnd", gs, "g");
+  return b.build("Series RLC at resonance (Q ≈ 10)");
+}
+
+function rcPhaseXY(): CircuitData {
+  const b = new Builder();
+  const v = b.add("vac", 2, 2, { amplitude: 2, frequency: 1000, rint: 0 }, 0, "V1");
+  const g1 = b.add("ground", 2, 9);
+  b.wire(v, "n", g1, "g");
+  const r = b.add("resistor", 6, 2, { resistance: 1000 });
+  const c = b.add("cap_ceramic", 12, 2, { capacitance: 159.15e-9 }, 90);
+  const g2 = b.add("ground", 12, 9);
+  b.wire(v, "p", r, "a");
+  b.wire(r, "b", c, "a");
+  b.wire(c, "b", g2, "g");
+  const sc = b.add("scope", 18, 0, { vdiv1: 1, vdiv2: 1, tdiv: 0.0005, display: "xy" });
+  const gs = b.add("ground", 16, 11);
+  b.wire(sc, "ch1", v, "p");
+  b.wire(sc, "ch2", c, "a");
+  b.wire(sc, "gnd", gs, "g");
+  return b.build("RC phase shift (45° at fc) — X–Y ellipse");
+}
+
+function voltageDoubler(): CircuitData {
+  const b = new Builder();
+  const v = b.add("vac", 2, 2, { amplitude: 10, frequency: 50, rint: 0.2 }, 0, "V1");
+  const g1 = b.add("ground", 2, 9);
+  b.wire(v, "n", g1, "g");
+  const c1 = b.add("cap_electrolytic", 6, 2, { capacitance: 470e-6, voltageRating: 35 });
+  const d1 = b.add("diode", 12, 7, {}, 270);
+  const d2 = b.add("diode", 14, 2);
+  const c2 = b.add("cap_electrolytic", 20, 2, { capacitance: 470e-6, voltageRating: 35 }, 90);
+  const rl = b.add("resistor", 24, 2, { resistance: 2200, powerRating: 0.5 }, 90);
+  const g2 = b.add("ground", 12, 12);
+  const g3 = b.add("ground", 20, 9);
+  const g4 = b.add("ground", 24, 9);
+  b.wire(v, "p", c1, "n");
+  b.wire(c1, "p", d1, "k");
+  b.wire(d1, "a", g2, "g");
+  b.wire(c1, "p", d2, "a");
+  b.wire(d2, "k", c2, "p");
+  b.wire(c2, "n", g3, "g");
+  b.wire(d2, "k", rl, "a");
+  b.wire(rl, "b", g4, "g");
+  const sc = b.add("scope", 28, 0, { vdiv1: 5, vdiv2: 5, tdiv: 0.01, trigSrc: "ch1" });
+  const gs = b.add("ground", 26, 11);
+  b.wire(sc, "ch1", v, "p");
+  b.wire(sc, "ch2", d2, "k");
+  b.wire(sc, "gnd", gs, "g");
+  return b.build("Villard voltage doubler (10 Vpk → ≈ 18 V DC)");
+}
+
+function zenerClipper(): CircuitData {
+  const b = new Builder();
+  const g = b.add("sigen", 2, 2, { waveform: "sine", amplitude: 10, ampType: "peak", offset: 0, frequency: 1000, rint: 0 }, 0, "FG1");
+  const g1 = b.add("ground", 2, 9);
+  b.wire(g, "n", g1, "g");
+  const r = b.add("resistor", 6, 2, { resistance: 1000 });
+  const z = b.add("zener", 12, 5, { vz: 5.1 }, 270);
+  const g2 = b.add("ground", 12, 11);
+  b.wire(g, "p", r, "a");
+  b.wire(r, "b", z, "k");
+  b.wire(z, "a", g2, "g");
+  const sc = b.add("scope", 18, 0, { vdiv1: 5, vdiv2: 2, tdiv: 0.0005, trigSrc: "ch1" });
+  const gs = b.add("ground", 16, 11);
+  b.wire(sc, "ch1", g, "p");
+  b.wire(sc, "ch2", z, "k");
+  b.wire(sc, "gnd", gs, "g");
+  return b.build("Function generator → zener clipper");
+}
 
 // ───────────────────────── Microcontroller presets ─────────────────────────
 // Uno placed at (12,2): left pins at x=12, right pins at x=21; pin n of a side sits at y = 2 + row.
@@ -247,7 +449,7 @@ function arduinoBlink(): CircuitData {
 
 function arduinoButton(): CircuitData {
   const b = new Builder();
-  const uno = b.add("arduino_uno", 12, 2, {}, 0, "UNO");
+  const uno = b.add("arduino_uno", 12, 2, { code: TEMPLATE_BUTTON }, 0, "UNO");
   mcuLed(b, uno, "d13", 24, 16);
   const btn = b.add("pushbutton", 24, 5);
   const gb = b.add("ground", 28, 8);
@@ -258,25 +460,9 @@ function arduinoButton(): CircuitData {
   return b.build("Arduino Uno — Button to LED");
 }
 
-const FADE_SKETCH = `int led = 9;
-int brightness = 0;
-int step = 5;
-
-void setup() {
-  pinMode(led, OUTPUT);
-}
-
-void loop() {
-  analogWrite(led, brightness);
-  brightness += step;
-  if (brightness <= 0 || brightness >= 255) step = -step;
-  delay(20);
-}
-`;
-
 function arduinoFade(): CircuitData {
   const b = new Builder();
-  const uno = b.add("arduino_uno", 12, 2, { code: FADE_SKETCH }, 0, "UNO");
+  const uno = b.add("arduino_uno", 12, 2, { code: tpl("fade") }, 0, "UNO");
   mcuLed(b, uno, "d9", 24, 12, "green");
   const g = b.add("ground", 21, 21);
   b.wire(uno, "gnd3", g, "g");
@@ -394,4 +580,11 @@ export const PRESETS: Preset[] = [
   { id: "uno-lcd", speed: 1, name: "Arduino · LCD 16×2", description: "LiquidCrystal in 4-bit mode with a simulated HD44780.", build: arduinoLcd },
   { id: "esp32-blink", speed: 1, name: "ESP32 · LED Blink", description: "ESP32 DevKit blinking GPIO2 (3.3 V logic).", build: esp32Blink },
   { id: "attiny-blink", speed: 1, name: "ATtiny85 · LED Blink", description: "ATtiny85 on a 5 V supply blinking PB1.", build: attinyBlink },
+  { id: "ac-mains", speed: 0.1, name: "AC · Mains → 5 V supply", description: "230 V mains, step-down transformer, bridge, reservoir cap and 7805; scope shows the ripple (AC-coupled) and the 5 V rail.", build: mainsSupply },
+  { id: "ac-ct", speed: 0.1, name: "AC · Centre-tap rectifier", description: "12-0-12 V transformer with two diodes: full-wave rectification with half the diode drops.", build: centreTapRectifier },
+  { id: "ac-transformer", speed: 0.1, name: "AC · Transformer step-down", description: "Primary vs secondary on the scope, true-RMS multimeter on the load.", build: transformerScope },
+  { id: "ac-rlc", speed: 0.01, name: "AC · Series RLC resonance", description: "10 mH + 1 µF + 10 Ω driven at f0 ≈ 1.59 kHz: the capacitor voltage reaches Q × the input.", build: rlcResonance },
+  { id: "ac-phase-xy", speed: 0.01, name: "AC · RC phase shift (X–Y)", description: "At fc the RC output lags 45°; X–Y mode draws the Lissajous ellipse.", build: rcPhaseXY },
+  { id: "ac-doubler", speed: 0.2, name: "AC · Voltage doubler", description: "Clamp + peak detector doubling a 10 V peak sine to ≈ 18 V DC.", build: voltageDoubler },
+  { id: "ac-clipper", speed: 0.01, name: "AC · Zener clipper", description: "A 10 V sine from the function generator clipped by a 5.1 V zener.", build: zenerClipper },
 ];

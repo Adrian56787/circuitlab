@@ -5,6 +5,8 @@ import {
   G_OPEN,
   GMIN,
   Junction,
+  THETA,
+  THETA_R,
   clamp,
   numParam,
   nv,
@@ -324,78 +326,161 @@ export class OptoDevice extends Device {
 
 // ───────────────────────── transformer ─────────────────────────
 
-/** Two coupled windings (backward-Euler), each with series resistance. Secondary is galvanically isolated. */
+interface Winding {
+  /** terminal pins (current is positive from a to b through the winding) */
+  a: string;
+  b: string;
+  r: number;
+}
+
+/**
+ * Coupled windings (two-winding transformer, or primary + two half-secondaries for the centre-tapped version),
+ * solved with the θ-method. Every winding is a branch variable obeying
+ *   V_k = R_k·i_k + Σ_j L_kj · di_j/dt,
+ * so the secondary is galvanically isolated and magnetising current, leakage and winding loss all emerge from L and R.
+ */
 export class TransformerDevice extends Device {
-  private readonly lp: number;
-  private readonly ls: number;
-  private readonly m: number;
-  private readonly rp: number;
-  private readonly rs: number;
+  private readonly w: Winding[];
+  private readonly L: number[][];
   private readonly iratedP: number;
   private readonly iratedS: number;
+  private readonly ct: boolean;
+  /** conductance across the primary representing iron (core) losses, specified as watts at 230 V */
+  private readonly gCore: number;
   constructor(comp: PlacedComponent, def: ComponentDef, nodes: number[], st: DeviceState) {
     super(comp, def, nodes, st);
-    this.branches = 2;
+    this.ct = comp.kind === "transformer_ct";
+    this.gCore = Math.max(0, numParam(comp.params, "coreLoss", 1)) / (230 * 230);
     const ratio = Math.max(0.001, numParam(comp.params, "turnsRatio", 0.1));
-    this.lp = Math.max(1e-6, numParam(comp.params, "primaryInductance", 5));
-    this.ls = this.lp * ratio * ratio;
+    const lp = Math.max(1e-6, numParam(comp.params, "primaryInductance", 5));
     const k = clamp(numParam(comp.params, "coupling", 0.995), 0.5, 0.99999);
-    this.m = k * Math.sqrt(this.lp * this.ls);
-    this.rp = Math.max(1e-3, numParam(comp.params, "primaryResistance", 5));
-    this.rs = Math.max(1e-4, this.rp * ratio * ratio);
+    const rp = Math.max(1e-3, numParam(comp.params, "primaryResistance", 5));
     this.iratedP = Math.max(0.01, numParam(comp.params, "ratedCurrent", 0.5));
-    this.iratedS = this.iratedP / ratio;
+    if (this.ct) {
+      const h = ratio / 2; // each half winding
+      const lh = lp * h * h;
+      const m = k * Math.sqrt(lp * lh);
+      const rh = Math.max(1e-4, rp * h * h);
+      this.w = [
+        { a: "p1", b: "p2", r: rp },
+        { a: "s1", b: "sc", r: rh },
+        { a: "sc", b: "s2", r: rh },
+      ];
+      this.L = [
+        [lp, m, m],
+        [m, lh, k * lh],
+        [m, k * lh, lh],
+      ];
+      this.iratedS = this.iratedP / ratio;
+    } else {
+      const ls = lp * ratio * ratio;
+      const m = k * Math.sqrt(lp * ls);
+      this.w = [
+        { a: "p1", b: "p2", r: rp },
+        { a: "s1", b: "s2", r: Math.max(1e-4, rp * ratio * ratio) },
+      ];
+      this.L = [
+        [lp, m],
+        [m, ls],
+      ];
+      this.iratedS = this.iratedP / ratio;
+    }
+    this.branches = this.w.length;
     this.thermalGain = 3;
   }
+  private i(w: number): number {
+    return this.st.n[`i${w}`] ?? 0;
+  }
   stamp(s: Stamper, ctx: StepCtx): void {
+    const n = this.w.length;
+    const row = (k: number): number => s.nodeCount + this.branchBase + k;
     if (this.st.burned) {
-      // open-circuit both windings: branch current forced to zero
-      s.add(s.nodeCount + this.branchBase, s.nodeCount + this.branchBase, 1);
-      s.add(s.nodeCount + this.branchBase + 1, s.nodeCount + this.branchBase + 1, 1);
+      // open-circuit every winding: branch currents forced to zero
+      for (let k = 0; k < n; k++) s.add(row(k), row(k), 1);
       return;
     }
-    const k = ctx.dc ? 0 : 1 / ctx.dt;
-    const i1 = this.st.n.i1 ?? 0;
-    const i2 = this.st.n.i2 ?? 0;
-    const row = (w: 0 | 1): number => s.nodeCount + this.branchBase + w;
-    const p1 = this.pinNode("p1");
-    const p2 = this.pinNode("p2");
-    const s1 = this.pinNode("s1");
-    const s2 = this.pinNode("s2");
-    s.voltageSource(this.branchBase, p1, p2, -k * (this.lp * i1 + this.m * i2));
-    s.add(row(0), row(0), -(this.rp + k * this.lp));
-    s.add(row(0), row(1), -k * this.m);
-    s.voltageSource(this.branchBase + 1, s1, s2, -k * (this.ls * i2 + this.m * i1));
-    s.add(row(1), row(1), -(this.rs + k * this.ls));
-    s.add(row(1), row(0), -k * this.m);
+    if (this.gCore > 0) s.conductance(this.pinNode("p1"), this.pinNode("p2"), this.gCore);
+    const kk = ctx.dc ? 0 : 1 / (THETA * ctx.dt);
+    for (let a = 0; a < n; a++) {
+      let hist = 0;
+      for (let b = 0; b < n; b++) hist += this.L[a]![b]! * this.i(b);
+      const vl = ctx.dc ? 0 : THETA_R * (this.st.n[`vl${a}`] ?? 0);
+      s.voltageSource(this.branchBase + a, this.pinNode(this.w[a]!.a), this.pinNode(this.w[a]!.b), -kk * hist - vl);
+      s.add(row(a), row(a), -(this.w[a]!.r + kk * this.L[a]![a]!));
+      for (let b = 0; b < n; b++) if (b !== a) s.add(row(a), row(b), -kk * this.L[a]![b]!);
+    }
   }
-  private winding(x: Float64Array): [number, number] {
-    if (this.st.burned) return [0, 0];
-    return [x[this.branchIndexAbs]!, x[this.branchIndexAbs + 1]!];
+  private winding(x: Float64Array): number[] {
+    if (this.st.burned) return this.w.map(() => 0);
+    return this.w.map((_, k) => x[this.branchIndexAbs + k]!);
   }
   pinCurrents(x: Float64Array): number[] {
-    const [i1, i2] = this.winding(x);
-    // catalog order: p1, p2, s1, s2
-    return [i1, -i1, i2, -i2];
+    const i = this.winding(x);
+    const ic = this.st.burned ? 0 : this.gCore * (nv(x, this.pinNode("p1")) - nv(x, this.pinNode("p2")));
+    const ip = i[0]! + ic;
+    // catalog order: p1, p2, s1, s2   |   p1, p2, s1, sc, s2
+    if (this.ct) return [ip, -ip, i[1]!, i[2]! - i[1]!, -i[2]!];
+    return [ip, -ip, i[1]!, -i[1]!];
   }
   override stress(x: Float64Array): number {
-    const [i1, i2] = this.winding(x);
-    return Math.max(Math.abs(i1) / this.iratedP, Math.abs(i2) / this.iratedS);
+    const i = this.winding(x);
+    let s = Math.abs(i[0]!) / this.iratedP;
+    for (let k = 1; k < i.length; k++) s = Math.max(s, Math.abs(i[k]!) / this.iratedS);
+    return s;
+  }
+  private vSec(x: Float64Array): number {
+    return this.ct
+      ? nv(x, this.pinNode("s1")) - nv(x, this.pinNode("s2"))
+      : nv(x, this.pinNode("s1")) - nv(x, this.pinNode("s2"));
   }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
-    const [i1, i2] = this.winding(x);
-    this.st.n.i1 = i1;
-    this.st.n.i2 = i2;
+    const i = this.winding(x);
+    for (let k = 0; k < this.w.length; k++) {
+      this.st.n[`i${k}`] = i[k]!;
+      const v = nv(x, this.pinNode(this.w[k]!.a)) - nv(x, this.pinNode(this.w[k]!.b));
+      this.st.n[`vl${k}`] = ctx.dc ? 0 : v - this.w[k]!.r * i[k]!;
+    }
+    if (ctx.dc || this.st.burned) return;
+    // true-RMS and power read-outs: exponential window of 0.1 s of circuit time
+    const decay = Math.exp(-ctx.dt / 0.1);
+    const n = this.st.n;
+    const vp = nv(x, this.pinNode("p1")) - nv(x, this.pinNode("p2"));
+    const vs = this.vSec(x);
+    // secondary current delivered to the load: leaves the winding, i.e. −i (passive convention)
+    const isec = this.ct ? -(i[1]! + i[2]!) / 2 : -i[1]!;
+    const upd = (key: string, val: number): void => {
+      n[key] = (n[key] ?? 0) * decay + val * ctx.dt;
+    };
+    upd("sVp", vp * vp);
+    upd("sVs", vs * vs);
+    upd("sIp", i[0]! * i[0]!);
+    upd("sIs", isec * isec);
+    upd("sPin", vp * (i[0]! + this.gCore * vp));
+    upd("sPout", this.ct ? -(nv(x, this.pinNode("s1")) - nv(x, this.pinNode("sc"))) * i[1]! - (nv(x, this.pinNode("sc")) - nv(x, this.pinNode("s2"))) * i[2]! : -vs * i[1]!);
+    n.sW = (n.sW ?? 0) * decay + ctx.dt;
   }
   override aux(x: Float64Array): Record<string, number> {
-    const vs = nv(x, this.pinNode("s1")) - nv(x, this.pinNode("s2"));
-    const vp = nv(x, this.pinNode("p1")) - nv(x, this.pinNode("p2"));
-    return { vp, vs };
+    const n = this.st.n;
+    const w = n.sW ?? 0;
+    const r = (k: string): number => (w > 0 ? Math.sqrt(Math.max(0, (n[k] ?? 0) / w)) : 0);
+    const pin = w > 0 ? (n.sPin ?? 0) / w : 0;
+    const pout = w > 0 ? (n.sPout ?? 0) / w : 0;
+    return {
+      vp: nv(x, this.pinNode("p1")) - nv(x, this.pinNode("p2")),
+      vs: this.vSec(x),
+      vpRms: r("sVp"),
+      vsRms: r("sVs"),
+      ipRms: r("sIp"),
+      isRms: r("sIs"),
+      pin,
+      pout,
+      eff: pin > 1e-6 ? Math.max(0, Math.min(1, pout / pin)) : 0,
+    };
   }
   override report(x: Float64Array, ctx: StepCtx): ComponentSnapshot {
     const base = super.report(x, ctx);
-    base.current = this.winding(x)[0];
+    base.current = this.winding(x)[0]!;
     base.voltage = nv(x, this.pinNode("p1")) - nv(x, this.pinNode("p2"));
     return base;
   }

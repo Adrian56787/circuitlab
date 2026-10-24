@@ -8,6 +8,7 @@ import type { ComponentSnapshot, ParamField, PlacedComponent, Wire, WireColor } 
 import { UNIT_CHOICES, UNIT_SYMBOL, formatEng, prefixExp, splitEng } from "@/models/units";
 import { getLive, burnTimes, sim } from "@/engine/runtime";
 import { getIo } from "@/mcu/io";
+import { sourceValue } from "@/engine/devices";
 import { cn } from "@/lib/utils";
 import { useCircuitStore } from "@/store/circuitStore";
 import { useSimStore } from "@/store/simulationStore";
@@ -230,6 +231,7 @@ function ComponentInspector({ comp }: { comp: PlacedComponent }): React.JSX.Elem
             </div>
           ) : null}
           <Readout snap={snap} />
+          {def.sim === "transformer" && <TransformerReadout snap={snap} />}
         </>
       )}
 
@@ -242,6 +244,7 @@ function ComponentInspector({ comp }: { comp: PlacedComponent }): React.JSX.Elem
         </div>
       )}
 
+      {(comp.kind === "vac" || comp.kind === "sigen") && <WaveSummary comp={comp} />}
       {def.sim === "mcu" && <McuBlock id={comp.id} />}
       {def.sim === "none" && def.category !== "instrument" && def.kind !== "ground" && (
         <div className="border border-neon-amber/40 bg-neon-amber/5 p-2 text-[11px] text-neon-amber">
@@ -251,6 +254,70 @@ function ComponentInspector({ comp }: { comp: PlacedComponent }): React.JSX.Elem
       {(comp.kind === "toggle_switch" || comp.kind === "pushbutton" || comp.kind === "dip_switch") && (
         <div className="text-[11px] text-ink-faint">While the simulation is running, click the part on the canvas to operate it.</div>
       )}
+    </div>
+  );
+}
+
+/** Peak / RMS / mean / Vpp of a generator, computed by sampling one period of its waveform. */
+function WaveSummary({ comp }: { comp: PlacedComponent }): React.JSX.Element {
+  const f = Math.max(1e-6, Number(comp.params.frequency) || 1);
+  const N = 2000;
+  let lo = Infinity;
+  let hi = -Infinity;
+  let sum = 0;
+  let sq = 0;
+  for (let i = 0; i < N; i++) {
+    const v = sourceValue(comp, (i + 0.5) / N / f);
+    lo = Math.min(lo, v);
+    hi = Math.max(hi, v);
+    sum += v;
+    sq += v * v;
+  }
+  const mean = sum / N;
+  const rms = Math.sqrt(sq / N);
+  const cell = (label: string, text: string): React.JSX.Element => (
+    <div>
+      <div className="text-[9px] uppercase text-ink-faint">{label}</div>
+      <div className="text-neon-cyan">{text}</div>
+    </div>
+  );
+  return (
+    <div className="space-y-1.5 border border-bg-line bg-bg p-2 font-mono text-[11px]">
+      <div className="text-[9px] uppercase tracking-wider text-ink-faint">Waveform summary</div>
+      <div className="grid grid-cols-3 gap-2">
+        {cell("Max", formatEng(hi, "volt", 3))}
+        {cell("Min", formatEng(lo, "volt", 3))}
+        {cell("Vpp", formatEng(hi - lo, "volt", 3))}
+        {cell("Mean (DC)", formatEng(mean, "volt", 3))}
+        {cell("RMS", formatEng(rms, "volt", 3))}
+        {cell("Period", formatEng(1 / f, "second", 3))}
+      </div>
+    </div>
+  );
+}
+
+function TransformerReadout({ snap }: { snap: ComponentSnapshot }): React.JSX.Element {
+  const a = snap.aux;
+  const cell = (label: string, text: string, cls = "text-neon-cyan"): React.JSX.Element => (
+    <div>
+      <div className="text-[9px] uppercase text-ink-faint">{label}</div>
+      <div className={cls}>{text}</div>
+    </div>
+  );
+  const ratio = (a.vpRms ?? 0) > 1e-6 ? (a.vsRms ?? 0) / (a.vpRms ?? 1) : 0;
+  return (
+    <div className="space-y-1.5 border border-bg-line bg-bg p-2 font-mono text-[11px]">
+      <div className="text-[9px] uppercase tracking-wider text-ink-faint">AC read-outs (true RMS)</div>
+      <div className="grid grid-cols-3 gap-2">
+        {cell("Primary V", formatEng(a.vpRms ?? 0, "volt", 3))}
+        {cell("Secondary V", formatEng(a.vsRms ?? 0, "volt", 3))}
+        {cell("Vs / Vp", ratio ? ratio.toFixed(3) : "—")}
+        {cell("Primary I", formatEng(a.ipRms ?? 0, "amp", 3), "text-neon-green")}
+        {cell("Secondary I", formatEng(a.isRms ?? 0, "amp", 3), "text-neon-green")}
+        {cell("Efficiency", (a.pin ?? 0) > 1e-4 ? `${((a.eff ?? 0) * 100).toFixed(1)} %` : "—", "text-neon-amber")}
+        {cell("P in", formatEng(a.pin ?? 0, "watt", 3), "text-neon-amber")}
+        {cell("P out", formatEng(a.pout ?? 0, "watt", 3), "text-neon-amber")}
+      </div>
     </div>
   );
 }

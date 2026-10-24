@@ -216,10 +216,12 @@ export class Simulator {
    * Advance `simSeconds` of circuit time using at most `maxSteps` solver steps and `budgetMs` of wall time.
    * The step size adapts so that fast frames never stall the UI.
    */
-  advance(simSeconds: number, baseDt: number, maxSteps = 400, budgetMs = 10): AdvanceResult {
+  advance(simSeconds: number, baseDt: number, maxSteps = 400, budgetMs = 10, hardDt = Infinity): AdvanceResult {
     if (simSeconds <= 0) return { steps: 0, simulated: 0 };
     const planned = Math.min(maxSteps, Math.max(1, Math.ceil(simSeconds / baseDt)));
-    const dt = simSeconds / planned;
+    // `hardDt` is an accuracy / display ceiling (AC sources, scope time base): when the step budget cannot
+    // cover the requested time at that resolution the simulation simply runs slower than requested.
+    const dt = Math.min(simSeconds / planned, hardDt);
     const start = performance.now();
     const t0 = this.time;
     let done = 0;

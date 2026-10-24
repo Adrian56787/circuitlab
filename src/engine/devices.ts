@@ -29,27 +29,65 @@ export class DeviceState {
 export class ProbeBuffer {
   readonly t: Float64Array;
   readonly ch: Float32Array[];
+  /** per-sample minimum / maximum seen since the previous stored sample (peak-detect envelope) */
+  readonly lo: Float32Array[];
+  readonly hi: Float32Array[];
   head = 0;
   count = 0;
   lastT = -Infinity;
+  /** scope bookkeeping: last trigger time and a memo of the last computed sweep */
+  lastTrig = -Infinity;
+  memo: { key: string; value: unknown } | null = null;
   constructor(
     readonly channels: number,
     readonly capacity = 6000,
   ) {
     this.t = new Float64Array(capacity);
     this.ch = Array.from({ length: channels }, () => new Float32Array(capacity));
+    this.lo = Array.from({ length: channels }, () => new Float32Array(capacity));
+    this.hi = Array.from({ length: channels }, () => new Float32Array(capacity));
   }
-  push(t: number, values: number[]): void {
+  push(t: number, values: number[], lo?: number[], hi?: number[]): void {
     this.t[this.head] = t;
-    for (let i = 0; i < this.channels; i++) this.ch[i]![this.head] = values[i] ?? 0;
+    for (let i = 0; i < this.channels; i++) {
+      const v = values[i] ?? 0;
+      this.ch[i]![this.head] = v;
+      this.lo[i]![this.head] = lo ? Math.min(lo[i] ?? v, v) : v;
+      this.hi[i]![this.head] = hi ? Math.max(hi[i] ?? v, v) : v;
+    }
     this.head = (this.head + 1) % this.capacity;
     this.count = Math.min(this.count + 1, this.capacity);
     this.lastT = t;
   }
+  clear(): void {
+    this.head = 0;
+    this.count = 0;
+    this.lastT = -Infinity;
+    this.lastTrig = -Infinity;
+    this.memo = null;
+  }
+  /** Ring index of the i-th retained sample (0 = oldest). */
+  idx(i: number): number {
+    return (this.head - this.count + i + this.capacity * 2) % this.capacity;
+  }
   /** i = 0 is the oldest retained sample. */
   at(i: number): { t: number; v: (c: number) => number } {
-    const idx = (this.head - this.count + i + this.capacity * 2) % this.capacity;
+    const idx = this.idx(i);
     return { t: this.t[idx]!, v: (c) => this.ch[c]![idx]! };
+  }
+  timeAt(i: number): number {
+    return this.t[this.idx(i)]!;
+  }
+  /** Index of the first retained sample with time ≥ t (count when none). */
+  lowerBound(t: number): number {
+    let a = 0;
+    let b = this.count;
+    while (a < b) {
+      const m = (a + b) >> 1;
+      if (this.timeAt(m) < t) a = m + 1;
+      else b = m;
+    }
+    return a;
   }
 }
 
@@ -247,6 +285,14 @@ export class PotentiometerDevice extends Device {
   }
 }
 
+/**
+ * Integration weight of the θ-method used for C and L. θ = 0.5 is the trapezoidal rule (second order, no numerical
+ * damping, but rings after abrupt switching); θ = 1 is backward Euler (heavily damped). A slight bias keeps resonant
+ * circuits accurate while still damping switching artefacts.
+ */
+export const THETA = 0.55;
+export const THETA_R = (1 - THETA) / THETA;
+
 export class CapacitorDevice extends Device {
   private readonly c: number;
   private readonly a: number;
@@ -267,8 +313,8 @@ export class CapacitorDevice extends Device {
       return;
     }
     if (ctx.dc) return;
-    const g = this.c / ctx.dt;
-    s.branch(this.a, this.b, g, -g * (this.st.n.v ?? 0));
+    const g = this.c / (THETA * ctx.dt);
+    s.branch(this.a, this.b, g, -g * (this.st.n.v ?? 0) - THETA_R * (this.st.n.i ?? 0));
   }
   pinCurrents(x: Float64Array, ctx: StepCtx): number[] {
     if (this.st.burned) {
@@ -280,7 +326,7 @@ export class CapacitorDevice extends Device {
     }
     if (ctx.dc || ctx.dt <= 0) return [0, 0];
     const v = nv(x, this.a) - nv(x, this.b);
-    const i = (this.c / ctx.dt) * (v - (this.st.n.v ?? 0));
+    const i = (this.c / (THETA * ctx.dt)) * (v - (this.st.n.v ?? 0)) - THETA_R * (this.st.n.i ?? 0);
     return [i, -i];
   }
   override stress(x: Float64Array): number {
@@ -292,7 +338,11 @@ export class CapacitorDevice extends Device {
   }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
+    this.st.n.i = this.burned ? 0 : this.pinCurrents(x, ctx)[0]!;
     this.st.n.v = nv(x, this.a) - nv(x, this.b);
+  }
+  private get burned(): boolean {
+    return this.st.burned;
   }
   override aux(x: Float64Array): Record<string, number> {
     const v = nv(x, this.a) - nv(x, this.b);
@@ -316,9 +366,9 @@ export class InductorDevice extends Device {
   }
   private companion(ctx: StepCtx): { g: number; j: number } {
     if (ctx.dc) return { g: 1 / this.dcr, j: 0 };
-    const k = this.l / ctx.dt;
+    const k = this.l / (THETA * ctx.dt);
     const g = 1 / (this.dcr + k);
-    return { g, j: -g * k * (this.st.n.i ?? 0) };
+    return { g, j: g * (k * (this.st.n.i ?? 0) + THETA_R * (this.st.n.vl ?? 0)) };
   }
   stamp(s: Stamper, ctx: StepCtx): void {
     if (this.st.burned) return;
@@ -337,38 +387,89 @@ export class InductorDevice extends Device {
   }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
-    this.st.n.i = this.pinCurrents(x, ctx)[0]!;
+    const i = this.pinCurrents(x, ctx)[0]!;
+    this.st.n.i = i;
+    // voltage across the ideal inductance (terminal voltage minus the winding resistance drop)
+    this.st.n.vl = ctx.dc ? 0 : nv(x, this.a) - nv(x, this.b) - this.dcr * i;
   }
 }
 
 // ───────────────────────── sources ─────────────────────────
+
+/** Rise / fall time of generated edges as a fraction of the period (a perfectly vertical edge is not physical). */
+const EDGE_FRAC = 0.002;
+
+/** Peak amplitude implied by the "amplitude" field and its unit selector (peak / rms / peak-to-peak). */
+export function peakAmplitude(p: Params, fallback: number): number {
+  const a = numParam(p, "amplitude", fallback);
+  const t = strParam(p, "ampType", "peak");
+  return t === "rms" ? a * Math.SQRT2 : t === "pp" ? a / 2 : a;
+}
+
+type Wave = "sine" | "square" | "triangle" | "sawtooth";
+
+function waveOf(p: Params): { wave: Wave; duty: number } {
+  const w = strParam(p, "waveform", "square");
+  const duty = clamp(numParam(p, "duty", 50) / 100, 0.01, 0.99);
+  if (w === "sine" || w === "triangle" || w === "sawtooth") return { wave: w, duty };
+  return { wave: "square", duty }; // "square" and the legacy "pwm" are both a pulse train with adjustable duty
+}
+
+/** Normalised waveform shape in [-1, 1] at cycle phase `ph` ∈ [0, 1). */
+function shape(wave: Wave, duty: number, ph: number): number {
+  const e = EDGE_FRAC;
+  switch (wave) {
+    case "sine":
+      return Math.sin(2 * Math.PI * ph);
+    case "triangle":
+      return ph < 0.25 ? 4 * ph : ph < 0.75 ? 2 - 4 * ph : 4 * ph - 4;
+    case "sawtooth":
+      // rises from −1 to +1 over the cycle, then falls back quickly
+      if (ph < 1 - e) return -1 + (2 * ph) / (1 - e);
+      return 1 - (2 * (ph - (1 - e))) / e;
+    default: {
+      if (ph < e) return -1 + (2 * ph) / e;
+      if (ph < duty) return 1;
+      if (ph < duty + e) return 1 - (2 * (ph - duty)) / e;
+      return -1;
+    }
+  }
+}
 
 export function sourceValue(c: PlacedComponent, t: number): number {
   const p = c.params;
   switch (c.kind) {
     case "vac": {
       const f = numParam(p, "frequency", 50);
-      return numParam(p, "offset", 0) + numParam(p, "amplitude", 5) * Math.sin(2 * Math.PI * f * t + (numParam(p, "phase", 0) * Math.PI) / 180);
+      return numParam(p, "offset", 0) + peakAmplitude(p, 5) * Math.sin(2 * Math.PI * f * t + (numParam(p, "phase", 0) * Math.PI) / 180);
     }
     case "sigen": {
       const f = Math.max(1e-6, numParam(p, "frequency", 1));
-      const ph = (((t * f) % 1) + 1) % 1;
-      const amp = numParam(p, "amplitude", 2.5);
-      const off = numParam(p, "offset", 0);
-      switch (strParam(p, "waveform", "square")) {
-        case "sine":
-          return off + amp * Math.sin(2 * Math.PI * ph);
-        case "triangle":
-          return off + amp * (1 - 4 * Math.abs(ph - 0.5));
-        case "pwm":
-          return off + amp * (ph < numParam(p, "duty", 50) / 100 ? 1 : -1);
-        default:
-          return off + amp * (ph < 0.5 ? 1 : -1);
-      }
+      const ph = (((t * f + numParam(p, "phase", 0) / 360) % 1) + 1) % 1;
+      const { wave, duty } = waveOf(p);
+      return numParam(p, "offset", 0) + peakAmplitude(p, 2.5) * shape(wave, duty, ph);
     }
     default:
       return numParam(p, "voltage", 5);
   }
+}
+
+/** Seconds until the next waveform corner (edge start / end, peak) of a generator; Infinity for smooth sources. */
+export function nextBreakpoint(c: PlacedComponent, t: number): number {
+  if (c.kind !== "sigen") return Infinity;
+  const p = c.params;
+  const f = Math.max(1e-6, numParam(p, "frequency", 1));
+  const { wave, duty } = waveOf(p);
+  if (wave === "sine") return Infinity;
+  const x = t * f + numParam(p, "phase", 0) / 360;
+  const ph = x - Math.floor(x);
+  const e = EDGE_FRAC;
+  const bps = wave === "triangle" ? [0, 0.25, 0.75, 1] : wave === "sawtooth" ? [0, 1 - e, 1] : [0, e, duty, duty + e, 1];
+  for (const b of bps) {
+    const d = b - ph;
+    if (d > 1e-9) return d / f;
+  }
+  return (1 - ph) / f + 1e-9;
 }
 
 export class VoltageSourceDevice extends Device {
@@ -391,6 +492,10 @@ export class VoltageSourceDevice extends Device {
   }
   private value(ctx: StepCtx): number {
     return sourceValue(this.comp, ctx.t) * ctx.srcScale;
+  }
+  /** Land exactly on the corners of square / pulse / saw / triangle waveforms. */
+  override maxStep(t: number): number {
+    return nextBreakpoint(this.comp, t);
   }
   private get g(): number {
     return 1 / Math.max(this.rint, 1e-3);
@@ -1224,7 +1329,12 @@ export class MeterDevice extends Device {
     this.thermalGain = 0;
   }
   private get mode(): string {
-    return strParam(this.p, "mode", "voltage");
+    const m = strParam(this.p, "mode", "voltage");
+    return m === "voltage_ac" ? "voltage" : m === "current_ac" ? "current" : m;
+  }
+  /** AC modes report the true RMS over a sliding window (exponential, τ = 0.1 s of circuit time). */
+  private get ac(): boolean {
+    return strParam(this.p, "mode", "voltage").endsWith("_ac");
   }
   stamp(s: Stamper): void {
     if (this.comp.kind === "dmm") {
@@ -1282,24 +1392,41 @@ export class MeterDevice extends Device {
   }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     if (ctx.dc) return;
-    if (this.comp.kind === "scope") {
+    if (this.comp.kind === "dmm" && this.ac) {
+      const r = this.reading(x).value;
+      const decay = Math.exp(-ctx.dt / 0.1);
+      this.st.n.ms = (this.st.n.ms ?? 0) * decay + r * r * ctx.dt;
+      this.st.n.mw = (this.st.n.mw ?? 0) * decay + ctx.dt;
+    } else if (this.comp.kind === "scope") {
       const tdiv = numParam(this.p, "tdiv", 1e-3);
-      const every = Math.max(ctx.dt, (tdiv * 10) / 1200);
+      // ~4000 stored samples per screen; finer solver steps are folded into min/max envelopes
+      const every = (tdiv * 10) / 4000;
       let buf = probes.get(this.comp.id);
       if (!buf) {
-        buf = new ProbeBuffer(2);
+        buf = new ProbeBuffer(2, 65536);
         probes.set(this.comp.id, buf);
       }
+      const g = nv(x, this.pinNode("gnd"));
+      const v0 = nv(x, this.pinNode("ch1")) - g;
+      const v1 = nv(x, this.pinNode("ch2")) - g;
+      const n = this.st.n;
+      n.lo0 = Math.min(n.lo0 ?? v0, v0);
+      n.hi0 = Math.max(n.hi0 ?? v0, v0);
+      n.lo1 = Math.min(n.lo1 ?? v1, v1);
+      n.hi1 = Math.max(n.hi1 ?? v1, v1);
       if (ctx.t - buf.lastT >= every - 1e-15) {
-        const g = nv(x, this.pinNode("gnd"));
-        buf.push(ctx.t, [nv(x, this.pinNode("ch1")) - g, nv(x, this.pinNode("ch2")) - g]);
+        buf.push(ctx.t, [v0, v1], [n.lo0, n.lo1], [n.hi0, n.hi1]);
+        n.lo0 = v0;
+        n.hi0 = v0;
+        n.lo1 = v1;
+        n.hi1 = v1;
       }
     } else if (this.comp.kind === "logic_analyzer") {
       const tdiv = numParam(this.p, "tdiv", 1e-3);
-      const every = Math.max(ctx.dt, (tdiv * 10) / 1200);
+      const every = Math.max(ctx.dt, (tdiv * 10) / 2000);
       let buf = probes.get(this.comp.id);
       if (!buf) {
-        buf = new ProbeBuffer(8);
+        buf = new ProbeBuffer(8, 24000);
         probes.set(this.comp.id, buf);
       }
       if (ctx.t - buf.lastT >= every - 1e-15) {
@@ -1314,6 +1441,10 @@ export class MeterDevice extends Device {
   override aux(x: Float64Array): Record<string, number> {
     if (this.comp.kind === "dmm") {
       const r = this.reading(x);
+      if (this.ac) {
+        const w = this.st.n.mw ?? 0;
+        return { reading: w > 0 ? Math.sqrt((this.st.n.ms ?? 0) / w) : Math.abs(r.value), overload: 0 };
+      }
       return { reading: r.value, overload: r.overload ? 1 : 0 };
     }
     if (this.comp.kind === "scope") {
