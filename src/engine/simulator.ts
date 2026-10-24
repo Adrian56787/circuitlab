@@ -1,6 +1,6 @@
 import { CATALOG } from "@/models/catalog";
 import { pinKey } from "@/models/types";
-import type { ComponentSnapshot, LogicLevel, PlacedComponent, SimSnapshot, Wire } from "@/models/types";
+import type { ComponentSnapshot, FailureRecord, LogicLevel, PlacedComponent, SimSnapshot, Wire } from "@/models/types";
 import { Device, DeviceState, type ProbeStore, type StepCtx } from "./devices";
 import { createDevice } from "./factory";
 import { Stamper, solveInPlace } from "./mna";
@@ -40,9 +40,10 @@ export class Simulator {
   private converged = true;
   private iterations = 0;
   private burnedAnnounced = new Set<string>();
+  private failureLog: FailureRecord[] = [];
   private components: readonly PlacedComponent[] = [];
   /** Emitted when a part is destroyed. */
-  onBurn: ((comp: PlacedComponent) => void) | null = null;
+  onBurn: ((comp: PlacedComponent, reason: string) => void) | null = null;
 
   compile(components: readonly PlacedComponent[], wires: readonly Wire[]): void {
     this.components = components;
@@ -112,6 +113,7 @@ export class Simulator {
   repair(id: string): void {
     this.states.set(id, new DeviceState());
     this.burnedAnnounced.delete(id);
+    this.failureLog = this.failureLog.filter((f) => f.id !== id);
     this.compile(this.components, this.wires);
   }
 
@@ -120,6 +122,7 @@ export class Simulator {
     this.states.clear();
     this.probes.clear();
     this.burnedAnnounced.clear();
+    this.failureLog = [];
     this.x = new Float64Array(this.x.length);
     this.compile(this.components, this.wires);
   }
@@ -182,8 +185,10 @@ export class Simulator {
       d.accept(this.x, ctx, this.probes);
       if (d.st.burned && !this.burnedAnnounced.has(d.comp.id)) {
         this.burnedAnnounced.add(d.comp.id);
-        this.messages.push(`${d.comp.label} (${d.def.name}) was destroyed by overload.`);
-        this.onBurn?.(d.comp);
+        const reason = d.st.cause || `${d.def.name} was destroyed by overload.`;
+        this.failureLog.push({ id: d.comp.id, label: d.comp.label, name: d.def.name, time: this.time + dt, reason });
+        this.messages.push(`${d.comp.label}: ${reason}`);
+        this.onBurn?.(d.comp, reason);
       }
     }
     if (!dc) this.time += dt;
@@ -277,6 +282,7 @@ export class Simulator {
       logic: this.logicLevels(netVoltage),
       wireNet,
       burned: [...this.burnedAnnounced],
+      failures: this.failureLog.filter((f) => this.components.some((c) => c.id === f.id)),
       diagnostics: {
         messages: this.messages.slice(-6),
         autoGround: this.autoGround,

@@ -13,7 +13,7 @@ export const setLive = (s: SimSnapshot | null): void => {
 
 /** Burn animation bookkeeping: component id → performance.now() when it blew. */
 export const burnTimes = new Map<string, number>();
-sim.onBurn = (c) => {
+sim.onBurn = (c, reason) => {
   if (!burnTimes.has(c.id)) burnTimes.set(c.id, performance.now());
-  useUiStore.getState().notify(`${c.label} burnt out — overload exceeded its rating.`, "error");
+  useUiStore.getState().notify(`${c.label} burnt out. ${reason}`, "error", 12000);
 };

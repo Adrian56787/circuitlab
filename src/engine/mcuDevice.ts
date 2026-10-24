@@ -11,6 +11,7 @@ import {
   clamp,
   nv,
   type DeviceState,
+  type Limit,
   type ProbeStore,
   type StepCtx,
 } from "./devices";
@@ -222,6 +223,46 @@ export class McuDevice extends Device implements PinBus {
     return worst;
   }
 
+  /** Worst pin condition, described for the failure report. */
+  protected override limits(x: Float64Array): Limit[] {
+    const out: Limit[] = [];
+    const vg = nv(x, this.gnd);
+    for (const [idx, [g, vt]] of this.drv) {
+      const gpioPin = this.gpio.find((q) => q.idx === idx);
+      if (!gpioPin) continue;
+      out.push({
+        what: `current through pin ${gpioPin.num}`,
+        actual: g * (nv(x, this.nodes[idx]!) - vg - vt),
+        limit: 0.04,
+        unit: "amp",
+        hint: "A GPIO pin can only source/sink about 20–40 mA: use a series resistor, or drive heavy loads through a transistor.",
+      });
+    }
+    for (const sp of this.supply) {
+      if (sp.idx < 0) continue;
+      out.push({
+        what: "supply current",
+        actual: sp.g * (nv(x, this.nodes[sp.idx]!) - vg - sp.vt),
+        limit: sp.vt > 4 ? 0.5 : 0.15,
+        unit: "amp",
+        hint: "A supply pin is shorted or overloaded: check for a short between the supply and GND.",
+      });
+    }
+    for (const g of this.gpio) {
+      const v = nv(x, g.node) - vg;
+      if (v > this.board.vhigh + 1.5 || v < -1.0) {
+        out.push({
+          what: `voltage on pin ${g.num}`,
+          actual: v,
+          limit: this.board.vhigh + 1.5,
+          unit: "volt",
+          hint: "Never drive a pin above the board's logic level (or below GND): use a divider or level shifter.",
+        });
+      }
+    }
+    return out;
+  }
+
   override maxStep(t: number): number {
     if (!this.rt || !this.powered || this.rt.dead) return Infinity;
     const nt = this.rt.nextTime(t);
@@ -341,6 +382,12 @@ export class LcdDevice extends Device {
     if (this.st.burned) return 0;
     const v = nv(x, this.pin.vdd!) - nv(x, this.pin.vss!);
     return Math.max(this.blCurrent(x) / 0.12, Math.abs(v) / 7);
+  }
+  protected override limits(x: Float64Array): Limit[] {
+    return [
+      { what: "backlight current", actual: this.blCurrent(x), limit: 0.12, unit: "amp", hint: "Feed the backlight (A/K) through a series resistor." },
+      { what: "supply voltage", actual: nv(x, this.pin.vdd!) - nv(x, this.pin.vss!), limit: 7, unit: "volt", hint: "An HD44780 LCD runs from 5 V." },
+    ];
   }
 
   private level(x: Float64Array, id: string, ref: number, vdd: number): number {

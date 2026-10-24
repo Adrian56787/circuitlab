@@ -71,18 +71,33 @@ export function splitEng(value: number): { mantissa: number; prefix: string } {
 }
 
 /**
- * Parse "4.7k", "10 kΩ", "100n", "2u2"-style is not supported on purpose.
+ * Parse engineering notation typed by a person: "4.7k", "10 kΩ", "100uF", "2.2n", "1e-6", "47meg", "4k7", "-5V".
+ * Case matters for the SI prefix: "m" is milli, "M" is mega ("meg" is also mega, as in SPICE).
  * Returns NaN when the text cannot be understood.
  */
 export function parseEng(text: string): number {
-  const t = text.trim().replace(/[ΩωFHVAWs]|Hz|ohm(s)?/g, "").replace(/\s+/g, "");
-  const m = /^([+-]?\d*\.?\d+(?:e[+-]?\d+)?)([TGMkmuµnp]?)$/i.exec(t);
+  let t = text
+    .trim()
+    .replace(/,/g, ".")
+    .replace(/\s+/g, "")
+    .replace(/meg/gi, "M")
+    .replace(/ohms?|hz|farads?|henr(?:y|ies)|volts?|amps?|watts?|sec(?:onds?)?/gi, "")
+    .replace(/[ΩωFHVAWs]/g, "");
+  // "4k7" → "4.7k" (prefix used as decimal point)
+  const rn = /^([+-]?\d+)([TGMkmuµnp])(\d+)$/.exec(t);
+  if (rn) t = `${rn[1]}.${rn[3]}${rn[2]}`;
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)([TGMkmuµnp]?)$/i.exec(t);
   if (!m) return Number.NaN;
   const num = Number(m[1]);
   let sym = m[2] ?? "";
   if (sym === "u") sym = "µ";
-  // "m" is milli, "M" is mega – case matters.
-  return num * 10 ** prefixExp(sym);
+  if (sym === "K") sym = "k";
+  // lower-case t/g/p/n have no clash; "M" vs "m" keeps its case
+  if (sym === "t") sym = "T";
+  if (sym === "g") sym = "G";
+  if (sym === "P") sym = "p";
+  if (sym === "N") sym = "n";
+  return Number.isFinite(num) ? Number((num * 10 ** prefixExp(sym)).toPrecision(12)) : Number.NaN;
 }
 
 export function formatTime(seconds: number): string {

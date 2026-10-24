@@ -207,6 +207,8 @@ export interface ComponentSnapshot {
   /** Fraction 0..1+ of the rated limit that is being used. */
   stress: number;
   burned: boolean;
+  /** Why the part failed (set once `burned`): the exceeded rating, the numbers and a remedy. */
+  failure?: string;
   /** Free-form per-part display state (LED brightness, switch state ...). */
   aux: Record<string, number>;
 }
@@ -217,6 +219,16 @@ export interface SimDiagnostics {
   singular: boolean;
   converged: boolean;
   iterations: number;
+}
+
+/** A destroyed part and the reason, in the order the failures happened. */
+export interface FailureRecord {
+  id: string;
+  label: string;
+  name: string;
+  /** simulation time of the failure (s) */
+  time: number;
+  reason: string;
 }
 
 export interface SimSnapshot {
@@ -234,6 +246,8 @@ export interface SimSnapshot {
   wireNet: Record<string, string>;
   /** Ids of parts destroyed so far. */
   burned: string[];
+  /** Failure log with explanations. */
+  failures: FailureRecord[];
   diagnostics: SimDiagnostics;
 }
 

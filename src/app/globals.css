@@ -25,6 +25,28 @@ body {
   background: rgba(47, 216, 255, 0.28);
 }
 
+/* Slim, dark custom scrollbar for panels, menus and modals (WebKit + Firefox). */
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: #3a4452 #101216;
+  scrollbar-gutter: stable;
+}
+.scroll-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: #101216;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: #2a313b;
+  border: 2px solid #101216;
+  border-radius: 4px;
+}
+.scroll-thin::-webkit-scrollbar-thumb:hover {
+  background: #3f4a58;
+}
+
 @layer components {
   .panel-title {
     @apply font-mono text-[10px] font-semibold uppercase tracking-[0.18em] text-ink-dim;

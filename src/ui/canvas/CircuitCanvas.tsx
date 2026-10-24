@@ -13,11 +13,12 @@ import {
   snap as snapTo,
   worldToLocal,
 } from "@/models/geometry";
-import { GRID_PX, type PinRef, type PlacedComponent, type Vec2 } from "@/models/types";
+import { GRID_PX, type PinRef, type PlacedComponent, type Rotation, type Vec2 } from "@/models/types";
 import { formatEng } from "@/models/units";
 import { exportJson } from "@/storage/exporters";
 import { useCircuitStore } from "@/store/circuitStore";
 import { useSimStore } from "@/store/simulationStore";
+import { useSettingsStore } from "@/store/settingsStore";
 import { useUiStore } from "@/store/uiStore";
 import { useViewportStore } from "@/store/viewportStore";
 import { classifyWires, DARK_THEME, drawScene, wireHit, type WireClass } from "./renderScene";
@@ -65,6 +66,28 @@ export function CircuitCanvas(): React.JSX.Element {
     let hoverComp: string | null = null;
     let spaceDown = false;
     let boxRect: { x0: number; y0: number; x1: number; y1: number } | null = null;
+
+    // hover-dwell help card
+    let helpTimer = 0;
+    let helpFor: string | null = null;
+    let clientPos = { x: 0, y: 0 };
+    const clearHelp = (): void => {
+      window.clearTimeout(helpTimer);
+      helpFor = null;
+      if (useUiStore.getState().helpHover) useUiStore.getState().setHelpHover(null);
+    };
+    const scheduleHelp = (compId: string | null): void => {
+      if (compId === helpFor) return;
+      clearHelp();
+      if (!compId || !useSettingsStore.getState().hoverHelp) return;
+      helpFor = compId;
+      helpTimer = window.setTimeout(() => {
+        const c = useCircuitStore.getState().components.find((x) => x.id === compId);
+        const ui = useUiStore.getState();
+        if (!c || helpFor !== compId || mode.kind !== "idle" || wiring || ui.placingKind) return;
+        ui.setHelpHover({ kind: c.kind, x: clientPos.x, y: clientPos.y });
+      }, 650);
+    };
 
     let wireClass: Map<string, WireClass> = new Map();
     let classRevision = -1;
@@ -116,6 +139,13 @@ export function CircuitCanvas(): React.JSX.Element {
       const tol = 6 / (useViewportStore.getState().zoom * G);
       for (let i = wires.length - 1; i >= 0; i--) if (wireHit(wires[i]!, byId, p, tol)) return wires[i]!.id;
       return null;
+    };
+
+    /** Origin that centres a part (in the given orientation) under the cursor. */
+    const placementOrigin = (kind: string, world: Vec2, rotation: Rotation, mirror: boolean): Vec2 => {
+      const probe: PlacedComponent = { id: "probe", kind, x: 0, y: 0, rotation, mirror, params: {}, label: "" };
+      const b = componentBBox(probe);
+      return snapPt({ x: world.x - Math.round((b.x0 + b.x1) / 2), y: world.y - Math.round((b.y0 + b.y1) / 2) });
     };
 
     const simActive = (): boolean => useSimStore.getState().running || sim.time > 0;
@@ -214,32 +244,42 @@ export function CircuitCanvas(): React.JSX.Element {
       // placement ghost
       if (ui.placingKind && mouse.inside) {
         const def = getDef(ui.placingKind);
-        const [bx0, by0, bx1, by1] = def.bounds;
-        const p = snapPt({ x: mw.x - Math.round((bx0 + bx1) / 2), y: mw.y - Math.round((by0 + by1) / 2) });
+        const p = placementOrigin(def.kind, mw, ui.placeRotation, ui.placeMirror);
         const ghost: PlacedComponent = {
           id: "ghost",
           kind: def.kind,
           x: p.x,
           y: p.y,
-          rotation: 0,
-          mirror: false,
+          rotation: ui.placeRotation,
+          mirror: ui.placeMirror,
           params: { ...def.defaults },
           label: def.prefix,
         };
         ctx.save();
         ctx.globalAlpha = 0.6;
         ctx.translate(ghost.x * G, ghost.y * G);
+        ctx.rotate((ghost.rotation * Math.PI) / 180);
+        if (ghost.mirror) ctx.scale(-1, 1);
         ctx.scale(G, G);
         drawComponent(ctx, ghost, def, {
           view: v.viewStyle,
           stroke: DARK_THEME.select,
           dim: DARK_THEME.dim,
           accent: DARK_THEME.accent,
-          rotation: 0,
-          mirror: false,
+          rotation: ui.placeRotation,
+          mirror: ui.placeMirror,
           burned: false,
           now,
         });
+        ctx.restore();
+
+        // orientation read-out next to the ghost
+        const bb = componentBBox(ghost);
+        ctx.save();
+        ctx.font = `${Math.max(9, 11 / v.zoom)}px ui-monospace, Menlo, Consolas, monospace`;
+        ctx.fillStyle = DARK_THEME.select;
+        ctx.textBaseline = "top";
+        ctx.fillText(`${ui.placeRotation}°${ui.placeMirror ? " ⇋" : ""}  · R rotate`, bb.x0 * G, (bb.y1 + 0.4) * G);
         ctx.restore();
       }
 
@@ -287,6 +327,19 @@ export function CircuitCanvas(): React.JSX.Element {
       }
     };
 
+    const wrapText = (text: string, width: number): string[] => {
+      const out: string[] = [];
+      let line = "";
+      for (const word of text.split(/\s+/)) {
+        if (line && line.length + word.length + 1 > width) {
+          out.push(line);
+          line = word;
+        } else line = line ? `${line} ${word}` : word;
+      }
+      if (line) out.push(line);
+      return out;
+    };
+
     const drawTooltip = (): void => {
       const v = useViewportStore.getState();
       const snap = getLive();
@@ -297,7 +350,9 @@ export function CircuitCanvas(): React.JSX.Element {
         if (net && v.showVoltages) lines.push(`${formatEng(snap.netVoltage[net] ?? 0, "volt", 4)}`);
       } else if (hoverComp) {
         const cs = snap.components[hoverComp];
-        if (cs && v.showVoltages) {
+        if (cs?.burned && cs.failure) {
+          lines.push("✕ FAILED", ...wrapText(cs.failure, 52));
+        } else if (cs && v.showVoltages) {
           lines.push(`V ${formatEng(cs.voltage, "volt", 3)}   I ${formatEng(cs.current, "amp", 3)}`);
           lines.push(`P ${formatEng(Math.abs(cs.power), "watt", 3)}   load ${(cs.stress * 100).toFixed(0)}%`);
         }
@@ -310,13 +365,15 @@ export function CircuitCanvas(): React.JSX.Element {
       const x = Math.min(w - tw - 6, mouse.sx + 14);
       const y = Math.min(h - th - 6, mouse.sy + 14);
       ctx.fillStyle = "rgba(16,18,22,0.94)";
-      ctx.strokeStyle = "#2fd8ff";
+      ctx.strokeStyle = lines[0] === "✕ FAILED" ? "#ff4d5e" : "#2fd8ff";
       ctx.lineWidth = 1;
       ctx.fillRect(x, y, tw, th);
       ctx.strokeRect(x + 0.5, y + 0.5, tw, th);
-      ctx.fillStyle = "#d7dde5";
       ctx.textBaseline = "middle";
-      lines.forEach((l, i) => ctx.fillText(l, x + 7, y + 12 + i * 15));
+      lines.forEach((l, i) => {
+        ctx.fillStyle = l === "✕ FAILED" ? "#ff4d5e" : "#d7dde5";
+        ctx.fillText(l, x + 7, y + 12 + i * 15);
+      });
       ctx.restore();
     };
 
@@ -381,6 +438,7 @@ export function CircuitCanvas(): React.JSX.Element {
 
     const onPointerDown = (e: PointerEvent): void => {
       canvas.setPointerCapture(e.pointerId);
+      clearHelp();
       const { sx, sy } = local(e);
       mouse.sx = sx;
       mouse.sy = sy;
@@ -396,10 +454,8 @@ export function CircuitCanvas(): React.JSX.Element {
 
       // placing
       if (ui.placingKind) {
-        const def = getDef(ui.placingKind);
-        const [bx0, by0, bx1, by1] = def.bounds;
-        const p = snapPt({ x: world.x - Math.round((bx0 + bx1) / 2), y: world.y - Math.round((by0 + by1) / 2) });
-        cs.addComponent(ui.placingKind, p.x, p.y);
+        const p = placementOrigin(ui.placingKind, world, ui.placeRotation, ui.placeMirror);
+        cs.addComponent(ui.placingKind, p.x, p.y, undefined, { rotation: ui.placeRotation, mirror: ui.placeMirror });
         return;
       }
 
@@ -465,6 +521,7 @@ export function CircuitCanvas(): React.JSX.Element {
       mouse.sx = sx;
       mouse.sy = sy;
       mouse.inside = true;
+      clientPos = { x: e.clientX, y: e.clientY };
       const world = toWorld(sx, sy);
 
       if (mode.kind === "pan") {
@@ -500,6 +557,7 @@ export function CircuitCanvas(): React.JSX.Element {
       const prevComp = hoverComp;
       hoverPin = pinAt(world);
       hoverComp = hoverPin ? null : (componentAt(world)?.id ?? null);
+      if (mode.kind === "idle") scheduleHelp(hoverComp);
       if (hoverPin !== prevPin || hoverComp !== prevComp || wiring || useUiStore.getState().placingKind || getLive()) mark();
       canvas.style.cursor = hoverPin
         ? "crosshair"
@@ -571,6 +629,7 @@ export function CircuitCanvas(): React.JSX.Element {
     };
 
     const onPointerLeave = (): void => {
+      clearHelp();
       mouse.inside = false;
       hoverPin = null;
       hoverComp = null;
@@ -615,8 +674,7 @@ export function CircuitCanvas(): React.JSX.Element {
       e.preventDefault();
       const r = canvas.getBoundingClientRect();
       const world = toWorld(e.clientX - r.left, e.clientY - r.top);
-      const [bx0, by0, bx1, by1] = getDef(kind).bounds;
-      const p = snapPt({ x: world.x - Math.round((bx0 + bx1) / 2), y: world.y - Math.round((by0 + by1) / 2) });
+      const p = placementOrigin(kind, world, 0, false);
       useCircuitStore.getState().addComponent(kind, p.x, p.y);
       canvas.focus();
     };
@@ -669,9 +727,12 @@ export function CircuitCanvas(): React.JSX.Element {
         e.preventDefault();
         cs.deleteSelection();
       } else if (!mod && k === "r") {
-        cs.rotateSelection();
+        // while a part is armed for placement, R turns the ghost (not the selection)
+        if (ui.placingKind) ui.rotatePlacing(e.shiftKey);
+        else cs.rotateSelection();
       } else if (!mod && k === "f") {
-        cs.mirrorSelection();
+        if (ui.placingKind) ui.flipPlacing();
+        else cs.mirrorSelection();
       } else if (!mod && k === "w") {
         ui.setTool("wire");
       } else if (!mod && k === "v") {
@@ -709,6 +770,7 @@ export function CircuitCanvas(): React.JSX.Element {
     window.addEventListener("keyup", onKeyUp);
 
     return () => {
+      clearHelp();
       cancelAnimationFrame(raf);
       ro.disconnect();
       unsubs.forEach((u) => u());

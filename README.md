@@ -6,7 +6,7 @@ Interactive electronics simulator: Next.js 15 (App Router, strict TypeScript), T
 npm install
 npm run dev          # http://localhost:3000
 npm run typecheck
-npm run selftest     # ~170 checks (solver, AC, scope, generators, transformers, Arduino compiler, MCU-in-circuit, presets)
+npm run selftest     # ~210 checks (solver, AC, scope, generators, transformers, Arduino compiler, MCU-in-circuit, presets)
 npm run build
 ```
 
@@ -14,9 +14,9 @@ npm run build
 
 | Path | Responsibility |
 | --- | --- |
-| `src/models` | Domain types, the 60-part catalog, geometry/routing, units, resistor colour code |
+| `src/models` | Domain types, the 61-part catalog, per-part help texts (`help.ts`), library feature groups, geometry/routing, units (engineering-notation parser), resistor colour code |
 | `src/engine` | Netlist (union-find), dense MNA stamper, device models, transient simulator, runtime singletons |
-| `src/store` | Zustand: circuit + undo/redo, viewport, UI, simulation controls |
+| `src/store` | Zustand: circuit + undo/redo, viewport, UI, simulation controls, persisted settings (`settingsStore.ts`) |
 | `src/ui/canvas` | Canvas renderer, schematic + physical symbols, interaction (pan/zoom/drag/wire) |
 | `src/ui/panels` | Library, inspector, toolbar, bottom dock (instruments / code editor / serial monitor), colour-code calculator |
 | `src/mcu` | Arduino-C++ subset compiler (lexer → parser → JS generators), board specs, MCU runtime (virtual time, PWM, ADC, Serial, Servo, LiquidCrystal, interrupts) |
@@ -57,6 +57,23 @@ HC-SR04, LCD 16×2 (HD44780 4/8-bit protocol decoder), multimeter (DC and true-R
   Vpp/mean/RMS/frequency/period read-outs, hover cursors, STOP, AUTO set and PNG export.
 * **AC presets**: 230 V mains supply with regulator, centre-tap full-wave rectifier, step-down transformer with
   AC voltmeter, series RLC resonance, RC phase shift in X-Y, voltage doubler, zener clipper.
+
+## Learning aids and usability
+
+* **Part help**: hover a part in the library (or rest the pointer on it in the canvas) for a card with what it does, how it
+  behaves, key formulas (Ohm's law, RC time constants, truth tables …) and typical uses; the Inspector has an
+  *About this part* section. Texts live in `src/models/help.ts` (a self-test checks every part has one).
+* **Rotate before placing**: arm a part, press `R` (clockwise), `Shift+R` (counter-clockwise) or `F` (mirror). The ghost
+  follows the orientation and the part is placed that way; a small bar above the canvas shows the angle.
+* **Settings (gear icon)**: switch whole library categories on/off (logic gates, AC sources, semiconductors …) and choose
+  *Simple* or *Advanced* Inspector view (Simple hides model coefficients such as tolerance, DCR, coupling, forward
+  voltage). Preferences are stored in `localStorage`.
+* **Typed values**: every numeric Inspector field accepts engineering notation — `4.7k`, `100uF`, `2.2n`, `4k7`, `47meg`,
+  `1e-6` — Enter applies, Esc cancels, ↑/↓ step through E12 values; sliders have an exact-value box too.
+* **Failure diagnostics**: when a part burns, the toast, the status-bar *burnt · why?* log, the Inspector and the canvas
+  tooltip say exactly which rating was exceeded (e.g. "LED failed: forward current reached 2 A, exceeding the 30 mA
+  maximum rating …") and how to avoid it. Every device lists its rated quantities in `Device.limits()`.
+* **Examples menu** scrolls inside the window and has a filter box.
 
 ## Microcontrollers
 

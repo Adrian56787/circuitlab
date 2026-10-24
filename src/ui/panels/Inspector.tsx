@@ -4,8 +4,11 @@ import { Code2, Copy, FlipHorizontal2, Palette, RotateCw, Trash2, Wrench } from 
 import { useState, useSyncExternalStore } from "react";
 import { getDef } from "@/models/catalog";
 import { resistanceToBands } from "@/models/resistorColor";
+import { isAdvancedField } from "@/models/viewMode";
+import { useSettingsStore } from "@/store/settingsStore";
+import { HelpCard } from "./HelpCard";
 import type { ComponentSnapshot, ParamField, PlacedComponent, Wire, WireColor } from "@/models/types";
-import { UNIT_CHOICES, UNIT_SYMBOL, formatEng, prefixExp, splitEng } from "@/models/units";
+import { UNIT_CHOICES, UNIT_SYMBOL, formatEng, parseEng, prefixExp, splitEng } from "@/models/units";
 import { getLive, burnTimes, sim } from "@/engine/runtime";
 import { getIo } from "@/mcu/io";
 import { sourceValue } from "@/engine/devices";
@@ -21,6 +24,31 @@ type NumberField = Extract<ParamField, { type: "number" }>;
 
 const clamp = (v: number, lo?: number, hi?: number): number => Math.min(hi ?? Infinity, Math.max(lo ?? -Infinity, v));
 
+/** E12 preferred values, used by the ↑ / ↓ keys. */
+const E12 = [1, 1.2, 1.5, 1.8, 2.2, 2.7, 3.3, 3.9, 4.7, 5.6, 6.8, 8.2];
+
+/** Next / previous standard (E12) value around `v`. */
+function stepE12(v: number, dir: 1 | -1): number {
+  if (!(v > 0)) return dir > 0 ? 1 : v;
+  const exp = Math.floor(Math.log10(v));
+  const m = v / 10 ** exp;
+  const scale = [...E12, 10];
+  if (dir > 0) {
+    const n = scale.find((x) => x > m * 1.0001) ?? 10;
+    return Number((n * 10 ** exp).toPrecision(3));
+  }
+  const lower = scale.filter((x) => x < m * 0.9999);
+  const n = lower.length ? lower[lower.length - 1]! : 8.2 / 10;
+  return Number((n * 10 ** exp).toPrecision(3));
+}
+
+const PLAIN_NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i;
+
+/**
+ * Numeric field with direct keyboard entry. Type a plain number (the unit menu supplies the prefix) or a full value
+ * with engineering notation — "4.7k", "100uF", "2.2n", "4k7", "1e-6", "47meg". Enter applies, Esc cancels, ↑/↓ step
+ * through standard E12 values.
+ */
 function NumberEditor({ field, value, onChange }: { field: NumberField; value: number; onChange: (v: number) => void }): React.JSX.Element {
   const choices = UNIT_CHOICES[field.unit];
   const eng = splitEng(value);
@@ -28,51 +56,150 @@ function NumberEditor({ field, value, onChange }: { field: NumberField; value: n
   const mant = choices.includes(eng.prefix) ? eng.mantissa : Number((value / 10 ** prefixExp(prefix)).toPrecision(6));
   const [text, setText] = useState(String(mant));
   const [synced, setSynced] = useState(value);
+  const [err, setErr] = useState<string | null>(null);
+  const notify = useUiStore((s) => s.notify);
   if (synced !== value) {
     setSynced(value);
     setText(String(mant));
+    setErr(null);
   }
 
-  const commit = (t: string, p: string): void => {
-    const n = Number(t);
-    if (!Number.isFinite(n)) {
+  /** Apply `t` (typed text) with unit-menu prefix `p`; returns false when the text is not a number. */
+  const commit = (t: string, p: string): boolean => {
+    const raw = t.trim();
+    if (raw === "") {
       setText(String(mant));
-      return;
+      setErr(null);
+      return true;
     }
-    const v = clamp(n * 10 ** prefixExp(p), field.min, field.max);
+    const n = PLAIN_NUMBER.test(raw) ? Number(raw) * 10 ** prefixExp(p) : parseEng(raw);
+    if (!Number.isFinite(n)) {
+      setErr(`Can't read “${raw}”. Try 4.7k, 100n, 2.2u or 1e-3.`);
+      return false;
+    }
+    const v = clamp(n, field.min, field.max);
+    if (v !== n) notify(`${field.label} limited to ${formatEng(v, field.unit)} (allowed ${field.min !== undefined ? formatEng(field.min, field.unit) : "−∞"} … ${field.max !== undefined ? formatEng(field.max, field.unit) : "∞"}).`, "warn");
+    setErr(null);
+    if (v === value) setText(String(mant));
+    else onChange(v);
+    return true;
+  };
+
+  const step = (dir: 1 | -1): void => {
+    const raw = text.trim();
+    const cur = raw === "" ? value : PLAIN_NUMBER.test(raw) ? Number(raw) * 10 ** prefixExp(prefix) : parseEng(raw);
+    const base = Number.isFinite(cur) ? cur : value;
+    const v = clamp(stepE12(base, dir), field.min, field.max);
+    setErr(null);
     onChange(v);
   };
 
   return (
-    <div className="flex gap-1">
-      <Input
-        value={text}
-        inputMode="decimal"
-        onChange={(e) => setText(e.target.value)}
-        onBlur={() => commit(text, prefix)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-          if (e.key === "Escape") setText(String(mant));
-        }}
-        aria-label={field.label}
-        className="min-w-0 flex-1"
-      />
-      {choices.length > 1 || field.unit !== "none" ? (
-        <Select
-          value={prefix}
-          onChange={(e) => commit(text, e.target.value)}
-          aria-label={`${field.label} unit`}
-          className="w-[68px] shrink-0"
-        >
-          {choices.map((p) => (
-            <option key={p} value={p}>
-              {p}
-              {UNIT_SYMBOL[field.unit]}
-            </option>
-          ))}
-        </Select>
-      ) : null}
+    <div>
+      <div className="flex gap-1">
+        <Input
+          value={text}
+          inputMode="text"
+          spellCheck={false}
+          autoComplete="off"
+          placeholder="e.g. 4.7k"
+          onChange={(e) => {
+            setText(e.target.value);
+            setErr(null);
+          }}
+          onFocus={(e) => e.target.select()}
+          onBlur={() => {
+            if (!commit(text, prefix)) setText(String(mant));
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              if (commit(text, prefix)) (e.target as HTMLInputElement).blur();
+            } else if (e.key === "Escape") {
+              setText(String(mant));
+              setErr(null);
+              (e.target as HTMLInputElement).blur();
+            } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+              e.preventDefault();
+              step(e.key === "ArrowUp" ? 1 : -1);
+            }
+          }}
+          aria-label={field.label}
+          aria-invalid={err !== null}
+          title="Type a value: 4.7k, 100n, 2.2u, 4k7, 1e-6 … (↑ ↓ = next standard value)"
+          className={cn("min-w-0 flex-1", err && "border-neon-red/80 text-neon-red")}
+        />
+        {choices.length > 1 || field.unit !== "none" ? (
+          <Select
+            value={prefix}
+            onChange={(e) => {
+              const p = e.target.value;
+              // same number, new prefix (when the text holds a bare number); a full typed value keeps its own
+              const raw = text.trim();
+              if (PLAIN_NUMBER.test(raw)) commit(raw, p);
+              else commit(raw || String(mant), p);
+            }}
+            aria-label={`${field.label} unit`}
+            className="w-[68px] shrink-0"
+          >
+            {choices.map((p) => (
+              <option key={p} value={p}>
+                {p}
+                {UNIT_SYMBOL[field.unit]}
+              </option>
+            ))}
+          </Select>
+        ) : null}
+      </div>
+      {err && (
+        <div role="alert" className="mt-0.5 text-[10px] text-neon-red">
+          {err}
+        </div>
+      )}
     </div>
+  );
+}
+
+/** Small typed-value box next to a slider (exact value, engineering notation allowed). */
+function SliderValue({ field, value, onChange }: { field: Extract<ParamField, { type: "slider" }>; value: number; onChange: (v: number) => void }): React.JSX.Element {
+  const [text, setText] = useState(String(value));
+  const [synced, setSynced] = useState(value);
+  const [bad, setBad] = useState(false);
+  if (synced !== value) {
+    setSynced(value);
+    setText(String(value));
+    setBad(false);
+  }
+  const commit = (): void => {
+    const n = parseEng(text);
+    if (!Number.isFinite(n)) {
+      setBad(true);
+      setText(String(value));
+      return;
+    }
+    setBad(false);
+    const v = clamp(n, field.min, field.max);
+    setText(String(v));
+    if (v !== value) onChange(v);
+  };
+  return (
+    <Input
+      value={text}
+      inputMode="decimal"
+      aria-label={`${field.label} value`}
+      title={`Type an exact value (${field.min} … ${field.max})`}
+      onChange={(e) => setText(e.target.value)}
+      onFocus={(e) => e.target.select()}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        if (e.key === "Escape") {
+          setText(String(value));
+          (e.target as HTMLInputElement).blur();
+        }
+      }}
+      className={cn("w-16 shrink-0 text-right text-neon-cyan", bad && "border-neon-red/80")}
+    />
   );
 }
 
@@ -114,7 +241,7 @@ function FieldRow({ comp, field }: { comp: PlacedComponent; field: ParamField })
             onChange={(e) => update(comp.id, { [field.key]: Number(e.target.value) }, key)}
             className="h-1 min-w-0 flex-1 accent-neon-cyan"
           />
-          <span className="w-12 text-right font-mono text-[11px] text-neon-cyan">{typeof raw === "number" ? raw : ""}</span>
+          <SliderValue field={field} value={typeof raw === "number" ? raw : field.min} onChange={(v) => update(comp.id, { [field.key]: v })} />
         </div>
       );
       break;
@@ -177,6 +304,10 @@ function ComponentInspector({ comp }: { comp: PlacedComponent }): React.JSX.Elem
   const bump = useSimStore((s) => s.bump);
   useSimStore((s) => s.tick); // re-read live data ~10×/s
   const snap = getLive()?.components[comp.id];
+  const viewMode = useSettingsStore((s) => s.viewMode);
+  const setViewMode = useSettingsStore((s) => s.setViewMode);
+  const fields = viewMode === "simple" ? def.fields.filter((f) => !isAdvancedField(f)) : def.fields;
+  const hiddenFields = def.fields.length - fields.length;
 
   const bands =
     comp.kind === "resistor"
@@ -216,7 +347,10 @@ function ComponentInspector({ comp }: { comp: PlacedComponent }): React.JSX.Elem
         <>
           {snap.burned ? (
             <div className="space-y-2 border border-neon-red/60 bg-neon-red/10 p-2 font-mono text-[11px] text-neon-red">
-              <div>Component destroyed by overload.</div>
+              <div className="font-bold uppercase tracking-wider">Component destroyed</div>
+              <p className="whitespace-normal font-sans text-[12px] leading-snug text-ink">
+                {snap.failure ?? "It was driven beyond its rated limits for too long."}
+              </p>
               <Button
                 variant="danger"
                 size="sm"
@@ -237,12 +371,33 @@ function ComponentInspector({ comp }: { comp: PlacedComponent }): React.JSX.Elem
 
       {def.fields.length > 0 && (
         <div className="space-y-2.5">
-          <div className="panel-title">Parameters</div>
-          {def.fields.map((f) => (
+          <div className="flex items-center justify-between">
+            <div className="panel-title">Parameters</div>
+            <span className="font-mono text-[9px] uppercase tracking-wider text-ink-faint">{viewMode} view</span>
+          </div>
+          {fields.map((f) => (
             <FieldRow key={f.key} comp={comp} field={f} />
           ))}
+          {hiddenFields > 0 && (
+            <button
+              type="button"
+              onClick={() => setViewMode("advanced")}
+              className="w-full border border-dashed border-bg-line px-2 py-1.5 text-left font-mono text-[10px] text-ink-faint hover:border-neon-cyan/60 hover:text-neon-cyan"
+            >
+              {hiddenFields} advanced {hiddenFields === 1 ? "parameter" : "parameters"} hidden — switch to Advanced view
+            </button>
+          )}
         </div>
       )}
+
+      <details key={comp.kind} open={viewMode === "simple"} className="group border border-bg-line bg-bg">
+        <summary className="cursor-pointer select-none px-2 py-1.5 font-mono text-[10px] uppercase tracking-wider text-neon-cyan hover:bg-bg-raised">
+          About this part
+        </summary>
+        <div className="border-t border-bg-line p-2">
+          <HelpCard kind={comp.kind} />
+        </div>
+      </details>
 
       {(comp.kind === "vac" || comp.kind === "sigen") && <WaveSummary comp={comp} />}
       {def.sim === "mcu" && <McuBlock id={comp.id} />}

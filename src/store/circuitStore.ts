@@ -40,7 +40,7 @@ interface CircuitState {
   redo: () => void;
 
   // components
-  addComponent: (kind: string, x: number, y: number, params?: Params) => string;
+  addComponent: (kind: string, x: number, y: number, params?: Params, orient?: { rotation?: Rotation; mirror?: boolean }) => string;
   moveComponents: (ids: string[], dx: number, dy: number) => void;
   setComponentPosition: (id: string, x: number, y: number) => void;
   rotateSelection: () => void;
@@ -142,7 +142,7 @@ export const useCircuitStore = create<CircuitState>((set, get) => ({
       };
     }),
 
-  addComponent: (kind, x, y, params) => {
+  addComponent: (kind, x, y, params, orient) => {
     const def = getDef(kind);
     const id = uid("c");
     get().checkpoint();
@@ -154,8 +154,8 @@ export const useCircuitStore = create<CircuitState>((set, get) => ({
           kind,
           x,
           y,
-          rotation: 0,
-          mirror: false,
+          rotation: orient?.rotation ?? 0,
+          mirror: orient?.mirror ?? false,
           params: { ...def.defaults, ...params },
           label: nextLabel(s.components, kind),
         },

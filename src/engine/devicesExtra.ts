@@ -11,6 +11,7 @@ import {
   numParam,
   nv,
   type DeviceState,
+  type Limit,
   type ProbeStore,
   type StepCtx,
 } from "./devices";
@@ -55,6 +56,15 @@ export class JfetDevice extends BehaviouralDevice {
     const [ig, id] = this.pinCurrents(x) as [number, number, number];
     const vds = nv(x, this.nodes[1]!) - nv(x, this.nodes[2]!);
     return Math.max(Math.abs(id * vds) / 0.35, Math.abs(ig) / 0.01, Math.abs(vds) / 40);
+  }
+  protected override limits(x: Float64Array): Limit[] {
+    const [ig, id] = this.pinCurrents(x) as [number, number, number];
+    const vds = nv(x, this.nodes[1]!) - nv(x, this.nodes[2]!);
+    return [
+      { what: "power dissipation", actual: id * vds, limit: 0.35, unit: "watt", hint: "Reduce the drain current or the drain-source voltage." },
+      { what: "gate current", actual: ig, limit: 0.01, unit: "amp", hint: "The gate junction was forward-biased: keep VGS ≤ 0 for an N-channel JFET or add a gate resistor." },
+      { what: "drain-source voltage", actual: vds, limit: 40, unit: "volt", hint: "Use a lower supply voltage." },
+    ];
   }
   override report(x: Float64Array, ctx: StepCtx): ComponentSnapshot {
     const base = super.report(x, ctx);
@@ -126,6 +136,13 @@ export class ScrDevice extends Device {
     if (this.st.burned) return 0;
     const vak = nv(x, this.a) - nv(x, this.k);
     return Math.max(Math.abs(this.iak(x)) / this.imax, Math.abs(vak) / this.vdrm, this.igate(x) / 0.1);
+  }
+  protected override limits(x: Float64Array): Limit[] {
+    return [
+      { what: "anode current", actual: this.iak(x), limit: this.imax, unit: "amp", hint: "Add a series load resistance to limit the current once the SCR latches on." },
+      { what: "anode-cathode voltage", actual: nv(x, this.a) - nv(x, this.k), limit: this.vdrm, unit: "volt", hint: "Use an SCR with a higher blocking-voltage (VDRM) rating." },
+      { what: "gate current", actual: this.igate(x), limit: 0.1, unit: "amp", hint: "Add a resistor in series with the gate." },
+    ];
   }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
@@ -218,6 +235,13 @@ export class TriacDevice extends Device {
     if (this.st.burned) return 0;
     const v = nv(x, this.m2) - nv(x, this.m1);
     return Math.max(Math.abs(this.imt(x)) / this.imax, Math.abs(v) / this.vdrm, Math.abs(this.igate(x)) / 0.2);
+  }
+  protected override limits(x: Float64Array): Limit[] {
+    return [
+      { what: "main-terminal current", actual: this.imt(x), limit: this.imax, unit: "amp", hint: "Add load resistance or use a triac with a higher current rating." },
+      { what: "MT2-MT1 voltage", actual: nv(x, this.m2) - nv(x, this.m1), limit: this.vdrm, unit: "volt", hint: "Use a triac with a higher blocking-voltage rating." },
+      { what: "gate current", actual: this.igate(x), limit: 0.2, unit: "amp", hint: "Add a resistor in series with the gate." },
+    ];
   }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
@@ -312,6 +336,15 @@ export class OptoDevice extends Device {
     if (this.st.burned) return 0;
     const { ifw, ic, vce } = this.currents(x);
     return Math.max(ifw / 0.06, Math.abs(ic) / 0.05, Math.abs(ic * vce) / 0.15, Math.abs(vce) / 80);
+  }
+  protected override limits(x: Float64Array): Limit[] {
+    const { ifw, ic, vce } = this.currents(x);
+    return [
+      { what: "LED forward current", actual: ifw, limit: 0.06, unit: "amp", hint: "Put a series resistor on the input LED." },
+      { what: "output collector current", actual: ic, limit: 0.05, unit: "amp", hint: "Reduce the load on the phototransistor." },
+      { what: "output power dissipation", actual: ic * vce, limit: 0.15, unit: "watt", hint: "Reduce the output current or voltage." },
+      { what: "collector-emitter voltage", actual: vce, limit: 80, unit: "volt", hint: "Use a lower supply voltage." },
+    ];
   }
   override aux(x: Float64Array): Record<string, number> {
     const { ifw, ic } = this.currents(x);
@@ -428,6 +461,16 @@ export class TransformerDevice extends Device {
     for (let k = 1; k < i.length; k++) s = Math.max(s, Math.abs(i[k]!) / this.iratedS);
     return s;
   }
+  protected override limits(x: Float64Array): Limit[] {
+    const i = this.winding(x);
+    const out: Limit[] = [
+      { what: "primary current", actual: i[0]!, limit: this.iratedP, unit: "amp", hint: "The secondary is overloaded (or shorted): increase the load resistance or choose a larger transformer." },
+    ];
+    for (let k = 1; k < i.length; k++) {
+      out.push({ what: this.ct ? `secondary half ${k} current` : "secondary current", actual: i[k]!, limit: this.iratedS, unit: "amp", hint: "Increase the load resistance or choose a transformer with a higher current rating." });
+    }
+    return out;
+  }
   private vSec(x: Float64Array): number {
     return this.ct
       ? nv(x, this.pinNode("s1")) - nv(x, this.pinNode("s2"))
@@ -519,6 +562,9 @@ export class ServoDevice extends Device {
     if (this.st.burned) return 0;
     return Math.abs(nv(x, this.vcc) - nv(x, this.gnd)) / 7.5;
   }
+  protected override limits(x: Float64Array): Limit[] {
+    return [{ what: "supply voltage", actual: nv(x, this.vcc) - nv(x, this.gnd), limit: 7.5, unit: "volt", hint: "Hobby servos run from 4.8 – 6 V." }];
+  }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
     if (ctx.dc || this.st.burned) return;
@@ -587,6 +633,9 @@ export class UltrasonicDevice extends Device {
   override stress(x: Float64Array): number {
     if (this.st.burned) return 0;
     return Math.abs(nv(x, this.vcc) - nv(x, this.gnd)) / 6;
+  }
+  protected override limits(x: Float64Array): Limit[] {
+    return [{ what: "supply voltage", actual: nv(x, this.vcc) - nv(x, this.gnd), limit: 6, unit: "volt", hint: "The HC-SR04 runs from 5 V." }];
   }
   override maxStep(t: number): number {
     const s = this.st.n.echoStart;

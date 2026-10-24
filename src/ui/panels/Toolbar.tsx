@@ -19,6 +19,7 @@ import {
   Play,
   Redo2,
   RotateCcw,
+  Settings,
   SkipForward,
   Undo2,
   Zap,
@@ -35,6 +36,7 @@ import { useUiStore, type Tool } from "@/store/uiStore";
 import { useViewportStore } from "@/store/viewportStore";
 import { cn } from "@/lib/utils";
 import { Button } from "../primitives/button";
+import { Input } from "../primitives/input";
 
 export function fitView(): void {
   const host = document.getElementById("canvas-host");
@@ -63,7 +65,7 @@ export function fitView(): void {
   vp.setPan(w / 2 - ((x0 + x1) / 2) * GRID_PX * zoom, h / 2 - ((y0 + y1) / 2) * GRID_PX * zoom);
 }
 
-function Menu({ label, icon, children, align = "left" }: { label: string; icon: React.ReactNode; children: (close: () => void) => React.ReactNode; align?: "left" | "right" }): React.JSX.Element {
+function Menu({ label, icon, children, align = "left", scroll = false }: { label: string; icon: React.ReactNode; children: (close: () => void) => React.ReactNode; align?: "left" | "right"; scroll?: boolean }): React.JSX.Element {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -71,8 +73,15 @@ function Menu({ label, icon, children, align = "left" }: { label: string; icon: 
     const h = (e: MouseEvent): void => {
       if (!ref.current?.contains(e.target as Node)) setOpen(false);
     };
+    const k = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") setOpen(false);
+    };
     window.addEventListener("mousedown", h);
-    return () => window.removeEventListener("mousedown", h);
+    window.addEventListener("keydown", k);
+    return () => {
+      window.removeEventListener("mousedown", h);
+      window.removeEventListener("keydown", k);
+    };
   }, [open]);
   return (
     <div ref={ref} className="relative">
@@ -82,7 +91,14 @@ function Menu({ label, icon, children, align = "left" }: { label: string; icon: 
         <ChevronDown className="h-3 w-3" />
       </Button>
       {open && (
-        <div className={cn("absolute top-full z-40 mt-1 min-w-[260px] border border-bg-line bg-bg-panel shadow-2xl", align === "right" ? "right-0" : "left-0")}>
+        <div
+          className={cn(
+            "absolute top-full z-40 mt-1 min-w-[260px] border border-bg-line bg-bg-panel shadow-2xl",
+            // tall menus (the example list) scroll inside the viewport instead of running off the screen
+            scroll && "scroll-thin max-h-[calc(100vh-96px)] w-[340px] overflow-y-auto overscroll-contain",
+            align === "right" ? "right-0" : "left-0",
+          )}
+        >
           {children(() => setOpen(false))}
         </div>
       )}
@@ -115,10 +131,33 @@ export function loadPreset(p: Preset): void {
   });
 }
 
+/** Scrollable, filterable list of example circuits (lives inside the scrolling Examples menu). */
+function ExamplesList({ close }: { close: () => void }): React.JSX.Element {
+  const [q, setQ] = useState("");
+  const needle = q.trim().toLowerCase();
+  const list = needle ? PRESETS.filter((p) => `${p.name} ${p.description}`.toLowerCase().includes(needle)) : PRESETS;
+  return (
+    <>
+      <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-bg-line bg-bg-panel p-2">
+        <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter examples…" aria-label="Filter examples" autoFocus />
+        <span className="shrink-0 font-mono text-[10px] text-ink-faint">{list.length}/{PRESETS.length}</span>
+      </div>
+      {list.map((p) => (
+        <MenuItem key={p.id} onClick={() => { loadPreset(p); close(); }} sub={p.description}>
+          {p.name}
+        </MenuItem>
+      ))}
+      {list.length === 0 && <div className="p-4 text-center font-mono text-[11px] text-ink-faint">No example matches “{q}”.</div>}
+    </>
+  );
+}
+
 export function Toolbar(): React.JSX.Element {
   const tool = useUiStore((s) => s.tool);
   const setTool = useUiStore((s) => s.setTool);
   const notify = useUiStore((s) => s.notify);
+  const settingsOpen = useUiStore((s) => s.settingsOpen);
+  const setSettingsOpen = useUiStore((s) => s.setSettingsOpen);
   const canUndo = useCircuitStore((s) => s.past.length > 0);
   const canRedo = useCircuitStore((s) => s.future.length > 0);
   const undo = useCircuitStore((s) => s.undo);
@@ -188,12 +227,8 @@ export function Toolbar(): React.JSX.Element {
       </Menu>
       <input ref={fileRef} type="file" accept=".json,application/json" className="hidden" onChange={(e) => { void onImport(e.target.files?.[0]); e.target.value = ""; }} />
 
-      <Menu label="Examples" icon={<Layers className="h-3.5 w-3.5" />}>
-        {(close) => PRESETS.map((p) => (
-          <MenuItem key={p.id} onClick={() => { loadPreset(p); close(); }} sub={p.description}>
-            {p.name}
-          </MenuItem>
-        ))}
+      <Menu label="Examples" icon={<Layers className="h-3.5 w-3.5" />} scroll>
+        {(close) => <ExamplesList close={close} />}
       </Menu>
 
       <Sep />
@@ -218,6 +253,10 @@ export function Toolbar(): React.JSX.Element {
       <Button size="icon" variant="ghost" onClick={fitView} title="Fit to circuit"><Maximize className="h-3.5 w-3.5" /></Button>
 
       <div className="flex-1" />
+
+      <Button size="icon" variant={settingsOpen ? "active" : "ghost"} onClick={() => setSettingsOpen(true)} title="Settings" aria-label="Open settings" aria-haspopup="dialog">
+        <Settings className="h-3.5 w-3.5" />
+      </Button>
 
       <div className="flex items-center gap-1 border border-bg-line bg-bg px-1.5 py-0.5">
         <Button size="icon" variant={sim.running ? "active" : "primary"} onClick={sim.toggle} title={sim.running ? "Pause" : "Play"} aria-label={sim.running ? "Pause simulation" : "Run simulation"}>

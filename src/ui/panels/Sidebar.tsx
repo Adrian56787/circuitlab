@@ -1,27 +1,56 @@
 "use client";
 
 import { ChevronDown, ChevronRight, Search, X } from "lucide-react";
-import { useMemo } from "react";
-import { CATEGORIES, CATALOG_LIST, searchCatalog } from "@/models/catalog";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { CATEGORIES, CATALOG_LIST, getDef, searchCatalog } from "@/models/catalog";
+import { groupOf } from "@/models/featureGroups";
 import type { CategoryId, ComponentDef } from "@/models/types";
+import { useSettingsStore } from "@/store/settingsStore";
 import { useUiStore } from "@/store/uiStore";
 import { cn } from "@/lib/utils";
 import { DND_MIME } from "../canvas/CircuitCanvas";
 import { Input } from "../primitives/input";
+import { HelpPopover } from "./FloatingHelp";
 import { PartPreview } from "./PartPreview";
 
 function PartRow({ def, armed }: { def: ComponentDef; armed: boolean }): React.JSX.Element {
   const setPlacing = useUiStore((s) => s.setPlacing);
+  const hoverHelp = useSettingsStore((s) => s.hoverHelp);
+  const [tip, setTip] = useState<{ x: number; y: number } | null>(null);
+  const timer = useRef(0);
+  const hide = (): void => {
+    window.clearTimeout(timer.current);
+    setTip(null);
+  };
+  useEffect(() => () => window.clearTimeout(timer.current), []);
   return (
+    <>
     <button
       type="button"
       draggable
       onDragStart={(e) => {
+        hide();
         e.dataTransfer.setData(DND_MIME, def.kind);
         e.dataTransfer.effectAllowed = "copy";
       }}
-      onClick={() => setPlacing(armed ? null : def.kind)}
-      title={def.description}
+      onClick={() => {
+        hide();
+        setPlacing(armed ? null : def.kind);
+      }}
+      onMouseEnter={(e) => {
+        if (!hoverHelp) return;
+        const r = e.currentTarget.getBoundingClientRect();
+        window.clearTimeout(timer.current);
+        timer.current = window.setTimeout(() => setTip({ x: r.right, y: r.top }), 450);
+      }}
+      onMouseLeave={hide}
+      onFocus={(e) => {
+        if (!hoverHelp) return;
+        const r = e.currentTarget.getBoundingClientRect();
+        setTip({ x: r.right, y: r.top });
+      }}
+      onBlur={hide}
+      aria-label={`${def.name}. ${def.description}`}
       className={cn(
         "group flex w-full items-center gap-2 border-b border-bg-line/60 px-2 py-1.5 text-left transition-colors hover:bg-bg-raised",
         armed && "bg-neon-cyan/10 outline outline-1 -outline-offset-1 outline-neon-cyan/60",
@@ -36,6 +65,8 @@ function PartRow({ def, armed }: { def: ComponentDef; armed: boolean }): React.J
         <div className="truncate text-[10px] text-ink-faint">{def.description}</div>
       </div>
     </button>
+    {tip && <HelpPopover kind={def.kind} x={tip.x} y={tip.y} />}
+    </>
   );
 }
 
@@ -45,8 +76,17 @@ export function Sidebar(): React.JSX.Element {
   const open = useUiStore((s) => s.openCategories);
   const toggle = useUiStore((s) => s.toggleCategory);
   const placing = useUiStore((s) => s.placingKind);
+  const disabled = useSettingsStore((s) => s.disabledGroups);
 
-  const results = useMemo(() => searchCatalog(search), [search]);
+  // parts of switched-off categories disappear from the library (and from search)
+  const results = useMemo(() => searchCatalog(search).filter((d) => !disabled[groupOf(d)]), [search, disabled]);
+  const visibleTotal = useMemo(() => CATALOG_LIST.filter((d) => !disabled[groupOf(d)]).length, [disabled]);
+  const hiddenGroups = Object.keys(disabled).length;
+
+  // if the armed part's category was just switched off, stop placing it
+  useEffect(() => {
+    if (placing && disabled[groupOf(getDef(placing))]) useUiStore.getState().setPlacing(null);
+  }, [placing, disabled]);
   const searching = search.trim().length > 0;
 
   const byCat = useMemo(() => {
@@ -64,7 +104,10 @@ export function Sidebar(): React.JSX.Element {
       <div className="border-b border-bg-line p-2">
         <div className="panel-title mb-1.5 flex items-center justify-between">
           <span>Component library</span>
-          <span className="text-ink-faint">{CATALOG_LIST.length} parts</span>
+          <span className="text-ink-faint">
+            {visibleTotal}
+            {visibleTotal !== CATALOG_LIST.length ? ` / ${CATALOG_LIST.length}` : ""} parts
+          </span>
         </div>
         <div className="relative">
           <Search className="pointer-events-none absolute left-2 top-1.5 h-3.5 w-3.5 text-ink-faint" />
@@ -91,10 +134,10 @@ export function Sidebar(): React.JSX.Element {
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="scroll-thin min-h-0 flex-1 overflow-y-auto">
         {CATEGORIES.map((cat) => {
           const list = byCat.get(cat.id) ?? [];
-          if (searching && list.length === 0) return null;
+          if (list.length === 0 && (searching || hiddenGroups > 0)) return null;
           const isOpen = searching || open[cat.id];
           return (
             <section key={cat.id}>
@@ -114,6 +157,15 @@ export function Sidebar(): React.JSX.Element {
         })}
         {searching && results.length === 0 && (
           <div className="p-4 text-center font-mono text-[11px] text-ink-faint">No parts match “{search}”.</div>
+        )}
+        {hiddenGroups > 0 && (
+          <button
+            type="button"
+            onClick={() => useUiStore.getState().setSettingsOpen(true)}
+            className="block w-full border-t border-bg-line px-3 py-2 text-left font-mono text-[10px] text-ink-faint hover:bg-bg-raised hover:text-neon-cyan"
+          >
+            {hiddenGroups} {hiddenGroups === 1 ? "category is" : "categories are"} hidden — open Settings to change
+          </button>
         )}
       </div>
     </aside>

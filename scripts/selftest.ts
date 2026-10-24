@@ -10,6 +10,11 @@ import { sourceValue } from "../src/engine/devices";
 import { peekLcd } from "../src/engine/lcdStore";
 import { templateById } from "../src/mcu/templates";
 import type { PlacedComponent, Wire } from "../src/models/types";
+import { CATALOG_LIST } from "../src/models/catalog";
+import { HELP } from "../src/models/help";
+import { FEATURE_GROUPS, groupOf } from "../src/models/featureGroups";
+import { isAdvancedField } from "../src/models/viewMode";
+import { parseEng } from "../src/models/units";
 
 let n = 0;
 function comp(kind: string, label: string, params: Record<string, number | string | boolean> = {}): PlacedComponent {
@@ -984,6 +989,82 @@ for (const pr of PRESETS.filter((q) => /^(uno|esp32|attiny)-/.test(q.id))) {
     const l = peekLcd(data.components.find((c) => c.kind === "lcd1602")!.id);
     check("preset uno-lcd: row 0 starts with 'Hello'", l && String.fromCharCode(...l.ddram.slice(0, 5)) === "Hello" ? 1 : 0, 1, 0);
   }
+}
+
+
+// ───────── typed values, help, feature groups, failure diagnostics ─────────
+{
+  const cases: [string, number][] = [
+    ["4.7k", 4700], ["100uF", 1e-4], ["10 kΩ", 1e4], ["2.2n", 2.2e-9], ["1e-6", 1e-6], ["47meg", 47e6],
+    ["4k7", 4700], ["-5V", -5], ["5mV", 5e-3], ["1M", 1e6], ["1m", 1e-3], ["22pF", 22e-12], ["470µ", 470e-6], ["3,3k", 3300],
+  ];
+  for (const [t, v] of cases) check(`parseEng("${t}")`, parseEng(t), v, Math.abs(v) * 1e-9);
+  for (const t of ["abc", "", "k", "4.7.1k", "5x5"]) check(`parseEng("${t}") is NaN`, Number.isNaN(parseEng(t)) ? 1 : 0, 1, 0);
+
+  const missing = CATALOG_LIST.filter((d) => !HELP[d.kind]).map((d) => d.kind);
+  check(`every part has help text (missing: ${missing.join(",") || "none"})`, missing.length, 0, 0);
+  const thin = CATALOG_LIST.filter((d) => HELP[d.kind] && (HELP[d.kind]!.formulas.length === 0 || HELP[d.kind]!.uses.length === 0)).map((d) => d.kind);
+  check(`help has formulas and uses (thin: ${thin.join(",") || "none"})`, thin.length, 0, 0);
+  const gates = CATALOG_LIST.filter((d) => d.sim === "gate" || d.kind === "gate_not");
+  check("every gate help has a truth table", gates.every((d) => HELP[d.kind]?.table) ? 1 : 0, 1, 0);
+
+  const ids = new Set(FEATURE_GROUPS.map((g) => g.id));
+  check("every part maps to a known feature group", CATALOG_LIST.every((d) => ids.has(groupOf(d))) ? 1 : 0, 1, 0);
+  const empty = FEATURE_GROUPS.filter((g) => !CATALOG_LIST.some((d) => groupOf(d) === g.id)).map((g) => g.id);
+  check(`no empty feature group (${empty.join(",") || "none"})`, empty.length, 0, 0);
+  check("ground is in the locked core group", groupOf(getDef("ground")) === "core" ? 1 : 0, 1, 0);
+  // simple view must still leave every part with at least one field when it has any basic one
+  const bare = CATALOG_LIST.filter((d) => d.fields.length > 0 && d.fields.every(isAdvancedField)).map((d) => d.kind);
+  check(`simple view never hides every field (${bare.join(",") || "none"})`, bare.length, 0, 0);
+}
+
+function burnReason(parts: PlacedComponent[], w: Wire[], id: string, secs = 3): string | undefined {
+  const sim = new Simulator();
+  sim.compile(parts, w);
+  while (sim.time < secs && !sim.snapshot().components[id]!.burned) sim.step(1e-4);
+  return sim.snapshot().components[id]!.failure;
+}
+
+// LED straight across 5 V → explains the missing current-limiting resistor
+{
+  const v = comp("vdc", "V1", { voltage: 5, rint: 0 });
+  const d = comp("led", "D1");
+  const g = comp("ground", "GND");
+  const why = burnReason([v, d, g], [wire(v, "p", d, "a"), wire(d, "k", g, "g"), wire(v, "n", g, "g")], d.id);
+  console.log("      LED:", why);
+  check("LED failure explained (current + limit + resistor advice)", why && /forward current reached .*A, exceeding the .*maximum rating/.test(why) && /series resistor/.test(why) ? 1 : 0, 1, 0);
+}
+// resistor over its power rating
+{
+  const v = comp("vdc", "V1", { voltage: 12, rint: 0, currentLimit: 5 });
+  const r = comp("resistor", "R1", { resistance: 100, powerRating: 0.25 });
+  const g = comp("ground", "GND");
+  const why = burnReason([v, r, g], [wire(v, "p", r, "a"), wire(r, "b", g, "g"), wire(v, "n", g, "g")], r.id);
+  console.log("      Resistor:", why);
+  check("resistor failure explained (power vs rating)", why && /power dissipation reached 1\.44 W/.test(why) && /250 mW/.test(why) ? 1 : 0, 1, 0);
+}
+// reverse-biased electrolytic
+{
+  const v = comp("vdc", "V1", { voltage: 9, rint: 0, currentLimit: 5 });
+  const r = comp("resistor", "R1", { resistance: 10 });
+  const c = comp("cap_electrolytic", "C1", { capacitance: 100e-6, voltageRating: 16 });
+  const g = comp("ground", "GND");
+  const why = burnReason([v, r, c, g], [wire(v, "p", r, "a"), wire(r, "b", c, "n"), wire(c, "p", g, "g"), wire(v, "n", g, "g")], c.id, 5);
+  console.log("      Capacitor:", why);
+  check("capacitor failure explained (reverse voltage)", why && /reverse voltage/.test(why) ? 1 : 0, 1, 0);
+}
+// the simulator log also carries the failure with its label
+{
+  const v = comp("vdc", "V1", { voltage: 5, rint: 0 });
+  const d = comp("led", "D1");
+  const g = comp("ground", "GND");
+  const sim = new Simulator();
+  sim.compile([v, d, g], [wire(v, "p", d, "a"), wire(d, "k", g, "g"), wire(v, "n", g, "g")]);
+  while (sim.time < 3 && sim.snapshot().failures.length === 0) sim.step(1e-4);
+  const f = sim.snapshot().failures;
+  check("failure log has the LED with a reason", f.length === 1 && f[0]!.label === "D1" && f[0]!.reason.length > 20 ? 1 : 0, 1, 0);
+  sim.repair(d.id);
+  check("repair clears the failure log", sim.snapshot().failures.length, 0, 0);
 }
 
 console.log(failed === 0 ? "\nALL PASSED" : `\n${failed} FAILED`);

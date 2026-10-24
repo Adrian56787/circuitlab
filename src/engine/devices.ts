@@ -1,5 +1,6 @@
 import { LED_VF } from "@/models/catalog";
-import type { ComponentDef, ComponentSnapshot, Params, PlacedComponent } from "@/models/types";
+import type { ComponentDef, ComponentSnapshot, Params, PlacedComponent, UnitFamily } from "@/models/types";
+import { formatEng } from "@/models/units";
 import type { Stamper } from "./mna";
 
 // ───────────────────────── shared types ─────────────────────────
@@ -20,6 +21,8 @@ export class DeviceState {
   burned = false;
   /** 0…1; reaching 1 destroys the part. */
   heat = 0;
+  /** Human-readable explanation of why the part failed (filled in at the moment it burns). */
+  cause = "";
   n: Record<string, number> = {};
   f: Record<string, boolean> = {};
   /** Arbitrary persistent object (e.g. a microcontroller's running program). */
@@ -92,6 +95,19 @@ export class ProbeBuffer {
 }
 
 export type ProbeStore = Map<string, ProbeBuffer>;
+
+/** One rated quantity of a part, used to explain a failure ("current reached 45 mA, exceeding the 20 mA rating"). */
+export interface Limit {
+  /** quantity name, e.g. "current", "power dissipation" */
+  what: string;
+  actual: number;
+  limit: number;
+  unit: UnitFamily;
+  /** how to avoid the failure */
+  hint?: string;
+}
+
+const eng = (v: number, u: UnitFamily): string => formatEng(Math.abs(v), u, 3);
 
 export const VT = 0.025852; // thermal voltage at 300 K
 export const GMIN = 1e-12;
@@ -167,13 +183,42 @@ export abstract class Device {
   aux(_x: Float64Array, _ctx: StepCtx): Record<string, number> {
     return {};
   }
+  /** Every rated quantity that `stress` is built from (used only to explain a failure). */
+  protected limits(_x: Float64Array, _ctx: StepCtx): Limit[] {
+    return [];
+  }
+  /** Explain what destroyed the part: the most exceeded rating, with the numbers and a remedy. */
+  diagnose(x: Float64Array, ctx: StepCtx): string {
+    const name = this.def.name;
+    let worst: Limit | null = null;
+    let ratio = 0;
+    for (const l of this.limits(x, ctx)) {
+      const r = l.limit > 0 ? Math.abs(l.actual) / l.limit : 0;
+      if (r > ratio) {
+        ratio = r;
+        worst = l;
+      }
+    }
+    if (!worst) {
+      const s = this.stress(x, ctx);
+      return `${name} failed: it was driven to ${(s * 100).toFixed(0)} % of its rated limit for too long.`;
+    }
+    return (
+      `${name} failed: ${worst.what} reached ${eng(worst.actual, worst.unit)}, exceeding the ${eng(worst.limit, worst.unit)} maximum rating` +
+      ` (${ratio >= 10 ? `≈ ${ratio.toFixed(0)}× the limit` : `${(ratio * 100).toFixed(0)} % of the limit`}).${worst.hint ? " " + worst.hint : ""}`
+    );
+  }
   /** Commit state after a converged step. */
   accept(x: Float64Array, ctx: StepCtx, _probes: ProbeStore): void {
     if (this.thermalGain > 0 && !ctx.dc) {
       const s = this.stress(x, ctx);
       if (s > 1) this.st.heat = Math.min(1.2, this.st.heat + (s - 1) * this.thermalGain * ctx.dt);
       else this.st.heat = Math.max(0, this.st.heat - 0.4 * ctx.dt);
-      if (this.st.heat >= 1) this.st.burned = true;
+      if (this.st.heat >= 1 && !this.st.burned) {
+        // describe the failure while the overloaded operating point is still in `x`
+        this.st.cause = this.diagnose(x, ctx);
+        this.st.burned = true;
+      }
     }
   }
 
@@ -189,6 +234,7 @@ export abstract class Device {
       power,
       stress: this.stress(x, ctx),
       burned: this.st.burned,
+      ...(this.st.burned && this.st.cause ? { failure: this.st.cause } : {}),
       aux: { heat: this.st.heat, ...this.aux(x, ctx) },
     };
   }
@@ -227,6 +273,26 @@ export class ResistorDevice extends Device {
         return Math.abs(v) / numParam(this.p, "maxVoltage", 12);
       default:
         return 0;
+    }
+  }
+  protected override limits(x: Float64Array): Limit[] {
+    const v = nv(x, this.a) - nv(x, this.b);
+    switch (this.comp.kind) {
+      case "resistor":
+        return [
+          {
+            what: "power dissipation",
+            actual: (v * v) / this.r,
+            limit: numParam(this.p, "powerRating", 0.25),
+            unit: "watt",
+            hint: `It carried ${eng(v / this.r, "amp")} at ${eng(v, "volt")}. Use a higher-wattage resistor, or a larger resistance to cut the current.`,
+          },
+        ];
+      case "buzzer":
+      case "dc_motor":
+        return [{ what: "supply voltage", actual: v, limit: numParam(this.p, "maxVoltage", 12), unit: "volt", hint: "Power it from a lower voltage." }];
+      default:
+        return [];
     }
   }
   override aux(x: Float64Array): Record<string, number> {
@@ -336,6 +402,16 @@ export class CapacitorDevice extends Device {
     if (v >= 0) return v / rating;
     return this.polar ? -v / 1.5 : -v / rating;
   }
+  protected override limits(x: Float64Array): Limit[] {
+    const v = nv(x, this.a) - nv(x, this.b);
+    if (v >= 0) {
+      return [{ what: "voltage", actual: v, limit: numParam(this.p, "voltageRating", 50), unit: "volt", hint: "Choose a capacitor with a higher voltage rating." }];
+    }
+    if (this.polar) {
+      return [{ what: "reverse voltage", actual: -v, limit: 1.5, unit: "volt", hint: "Polarised capacitors must not be connected backwards: swap the + and − terminals." }];
+    }
+    return [{ what: "voltage", actual: -v, limit: numParam(this.p, "voltageRating", 50), unit: "volt", hint: "Choose a capacitor with a higher voltage rating." }];
+  }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
     this.st.n.i = this.burned ? 0 : this.pinCurrents(x, ctx)[0]!;
@@ -384,6 +460,17 @@ export class InductorDevice extends Device {
   override stress(x: Float64Array, ctx: StepCtx): number {
     if (this.st.burned) return 0;
     return Math.abs(this.pinCurrents(x, ctx)[0]!) / numParam(this.p, "currentRating", 1);
+  }
+  protected override limits(x: Float64Array, ctx: StepCtx): Limit[] {
+    return [
+      {
+        what: "current",
+        actual: this.pinCurrents(x, ctx)[0]!,
+        limit: numParam(this.p, "currentRating", 1),
+        unit: "amp",
+        hint: "At DC an inductor is only its winding resistance, so add series resistance or use a part with a higher current rating.",
+      },
+    ];
   }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
@@ -732,6 +819,33 @@ export class DiodeDevice extends Device {
     if (this.comp.kind === "zener") return Math.abs(i * v) / numParam(this.p, "maxPower", 0.5);
     return i > 0 ? i / numParam(this.p, "maxCurrent", 1) : 0;
   }
+  protected override limits(x: Float64Array): Limit[] {
+    const i = this.current(x);
+    const v = nv(x, this.leg.a) - nv(x, this.leg.k);
+    if (this.comp.kind === "zener") {
+      return [
+        {
+          what: "power dissipation",
+          actual: Math.abs(i * v),
+          limit: numParam(this.p, "maxPower", 0.5),
+          unit: "watt",
+          hint: "Put a series resistor in front of the zener to limit its current.",
+        },
+      ];
+    }
+    const led = this.comp.kind === "led";
+    return [
+      {
+        what: "forward current",
+        actual: Math.max(0, i),
+        limit: numParam(this.p, "maxCurrent", 1),
+        unit: "amp",
+        hint: led
+          ? "An LED has almost no resistance once it conducts: always add a series resistor, R ≥ (Vsupply − Vf) / I_max."
+          : "Limit the current with a series resistor or a part with a higher current rating.",
+      },
+    ];
+  }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
     this.st.n.vd = nv(x, this.leg.a) - nv(x, this.leg.k);
@@ -800,6 +914,16 @@ export class DiodeArrayDevice extends Device {
     if (this.st.burned) return 0;
     const max = numParam(this.p, "maxCurrent", 0.02);
     return Math.max(...this.legs.map((l) => this.legCurrent(x, l) / max), 0);
+  }
+  protected override limits(x: Float64Array): Limit[] {
+    const max = numParam(this.p, "maxCurrent", 0.02);
+    return this.legs.map((l) => ({
+      what: `segment/LED ${l.key} current`,
+      actual: this.legCurrent(x, l),
+      limit: max,
+      unit: "amp" as const,
+      hint: "Every LED segment needs its own series resistor (about 330 Ω at 5 V).",
+    }));
   }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
@@ -907,6 +1031,14 @@ export class BjtDevice extends Device {
     const p = Math.abs(nv(x, this.nC) * ic + nv(x, this.nB) * ib + nv(x, this.nE) * ie);
     return Math.max(Math.abs(ic) / numParam(this.p, "maxIc", 0.2), p / numParam(this.p, "maxPower", 0.625));
   }
+  protected override limits(x: Float64Array): Limit[] {
+    const { ic, ib, ie } = this.currents(x);
+    const p = Math.abs(nv(x, this.nC) * ic + nv(x, this.nB) * ib + nv(x, this.nE) * ie);
+    return [
+      { what: "collector current", actual: ic, limit: numParam(this.p, "maxIc", 0.2), unit: "amp", hint: "Reduce the load current or use a power transistor." },
+      { what: "power dissipation", actual: p, limit: numParam(this.p, "maxPower", 0.625), unit: "watt", hint: "It sat in its linear region with high Vce × Ic: drive it fully on/off or add a heatsink / bigger part." },
+    ];
+  }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
     this.st.n.vbe = this.sgn * (nv(x, this.nB) - nv(x, this.nE));
@@ -1009,6 +1141,14 @@ export class MosfetDevice extends Device {
     const id = this.drainCurrent(x);
     const vds = nv(x, this.nD) - nv(x, this.nS);
     return Math.max(Math.abs(id) / numParam(this.p, "maxId", 10), Math.abs(id * vds) / numParam(this.p, "maxPower", 20));
+  }
+  protected override limits(x: Float64Array): Limit[] {
+    const id = this.drainCurrent(x);
+    const vds = nv(x, this.nD) - nv(x, this.nS);
+    return [
+      { what: "drain current", actual: id, limit: numParam(this.p, "maxId", 10), unit: "amp", hint: "Reduce the load current or use a bigger MOSFET." },
+      { what: "power dissipation", actual: id * vds, limit: numParam(this.p, "maxPower", 20), unit: "watt", hint: "Drive the gate harder so it is fully on, or add a heatsink." },
+    ];
   }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
@@ -1122,6 +1262,12 @@ export class OpAmpDevice extends BehaviouralDevice {
     const vee = nv(x, this.nodes[4]!);
     return Math.max((vcc - vee) / 36, Math.abs(this.pinCurrents(x)[2]!) / 0.05);
   }
+  protected override limits(x: Float64Array): Limit[] {
+    return [
+      { what: "supply voltage", actual: nv(x, this.nodes[3]!) - nv(x, this.nodes[4]!), limit: 36, unit: "volt", hint: "Lower the supply rails." },
+      { what: "output current", actual: this.pinCurrents(x)[2]!, limit: 0.05, unit: "amp", hint: "The output is short-circuited or loaded too heavily: add a series resistor or a buffer transistor." },
+    ];
+  }
   override report(x: Float64Array, ctx: StepCtx): ComponentSnapshot {
     const base = super.report(x, ctx);
     base.current = this.pinCurrents(x)[2]!;
@@ -1183,6 +1329,15 @@ export class RegulatorDevice extends BehaviouralDevice {
     const iout = Math.abs(cur[this.idx("out")]!);
     const pd = Math.abs((nv(x, this.nodes[this.idx("in")]!) - nv(x, this.nodes[this.idx("out")]!)) * iout);
     return Math.max(iout / this.imax, pd / 25);
+  }
+  protected override limits(x: Float64Array): Limit[] {
+    const cur = this.pinCurrents(x);
+    const iout = Math.abs(cur[this.idx("out")]!);
+    const dv = nv(x, this.nodes[this.idx("in")]!) - nv(x, this.nodes[this.idx("out")]!);
+    return [
+      { what: "output current", actual: iout, limit: this.imax, unit: "amp", hint: "Reduce the load or use a higher-current regulator." },
+      { what: "power dissipation", actual: Math.abs(dv * iout), limit: 25, unit: "watt", hint: "(Vin − Vout) × I is turned into heat: lower the input voltage or use a switching regulator." },
+    ];
   }
   override report(x: Float64Array, ctx: StepCtx): ComponentSnapshot {
     const base = super.report(x, ctx);
@@ -1300,6 +1455,9 @@ export class Timer555Device extends Device {
   }
   override stress(x: Float64Array): number {
     return (nv(x, this.n("p8")) - nv(x, this.n("p1"))) / 18;
+  }
+  protected override limits(x: Float64Array): Limit[] {
+    return [{ what: "supply voltage", actual: nv(x, this.n("p8")) - nv(x, this.n("p1")), limit: 18, unit: "volt", hint: "A 555 runs from 4.5 – 16 V; use a lower supply." }];
   }
   override accept(x: Float64Array, ctx: StepCtx, probes: ProbeStore): void {
     super.accept(x, ctx, probes);
